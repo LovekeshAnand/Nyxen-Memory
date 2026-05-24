@@ -19,3 +19,13 @@ phase1_validation/report.json
 *.njsproj
 *.sln
 *.swp
+
+# Local dependencies and libraries
+.torch_cuda/
+D:/Nyxen-Memory/.torch_cuda/
+temp_pip/
+
+# Local databases and runtime data
+data/
+*.db
+

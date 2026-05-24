@@ -1,0 +1,7 @@
+torch
+transformers>=4.40.0
+sentence-transformers
+accelerate
+numpy
+python-dotenv
+requests
