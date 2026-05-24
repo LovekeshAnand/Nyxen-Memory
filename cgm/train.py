@@ -36,9 +36,12 @@ class MEGATrainer:
             # Zero gradients
             optimizer.zero_grad()
 
-            # 1. MEN projects triples to synthetic KV cache
             raw_kv_tuples = self.pipeline.men(x_triples)
-            past_key_values = DynamicCache.from_legacy_cache(tuple(raw_kv_tuples))
+            # Convert raw tuples to DynamicCache (compatible with transformers v5.9.0+)
+            past_key_values = DynamicCache()
+            for k, v in raw_kv_tuples:
+                past_key_values.key_cache.append(k)
+                past_key_values.value_cache.append(v)
 
             # 2. Prepare inputs for LLM forward pass
             # We concatenate the prompt_ids and target_ids

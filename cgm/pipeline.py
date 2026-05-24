@@ -147,8 +147,11 @@ class CGMPipeline:
                 with GPULockManager():
                     raw_kv_tuples = self.men(x_tensor)
                     
-                    # Convert raw tuples to DynamicCache (required by transformers v5.x)
-                    past_key_values = DynamicCache.from_legacy_cache(tuple(raw_kv_tuples))
+                    # Convert raw tuples to DynamicCache (compatible with transformers v5.9.0+)
+                    past_key_values = DynamicCache()
+                    for k, v in raw_kv_tuples:
+                        past_key_values.key_cache.append(k)
+                        past_key_values.value_cache.append(v)
                     print(f"[Pipeline] Memory KV cache created: {memory_length} memory positions across {len(raw_kv_tuples)} layers.")
                     
         # 5. Build prompt
