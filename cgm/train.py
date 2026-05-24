@@ -37,11 +37,10 @@ class MEGATrainer:
             optimizer.zero_grad()
 
             raw_kv_tuples = self.pipeline.men(x_triples)
-            # Convert raw tuples to DynamicCache (compatible with transformers v5.9.0+)
+            # Convert raw tuples to DynamicCache (compatible with all transformers versions)
             past_key_values = DynamicCache()
-            for k, v in raw_kv_tuples:
-                past_key_values.key_cache.append(k)
-                past_key_values.value_cache.append(v)
+            for idx, (k, v) in enumerate(raw_kv_tuples):
+                past_key_values.update(k, v, idx)
 
             # 2. Prepare inputs for LLM forward pass
             # We concatenate the prompt_ids and target_ids
