@@ -194,7 +194,12 @@ class CGMPipeline:
                     max_new_tokens=max_new_tokens,
                     pad_token_id=self.tokenizer.pad_token_id,
                     attention_mask=full_attention_mask,
-                    position_ids=position_ids
+                    position_ids=position_ids,
+                    do_sample=True,
+                    temperature=0.8,
+                    top_k=50,
+                    top_p=0.95,
+                    repetition_penalty=1.2
                 )
                 
         # 7. Decode and return response
@@ -202,4 +207,10 @@ class CGMPipeline:
         # Strip out prompt from output
         if response.startswith(prompt):
             response = response[len(prompt):].strip()
+            
+        # Cleanly truncate transcript-continuation loops (standard base model behavior)
+        for stop_word in ["\nUser:", "\nAssistant:", "\n👤", "\n🤖", "User:", "Assistant:"]:
+            if stop_word in response:
+                response = response.split(stop_word)[0].strip()
+                
         return response
