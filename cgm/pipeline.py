@@ -100,7 +100,7 @@ class CGMPipeline:
         if self._retriever is None: self.initialize()
         return self._retriever
 
-    def generate(self, conversation_id: str, query_text: str, k: int = 15, max_new_tokens: int = 100) -> str:
+    def generate(self, conversation_id: str, query_text: str, k: int = 15, max_new_tokens: int = 100, mode: str = "inject") -> str:
         """
         Runs pipeline: retrieves subgraph -> projects memory -> injects KVs -> generates response.
         Fully protected by VRAM guards, thread locks, and input bounds checking.
@@ -115,10 +115,10 @@ class CGMPipeline:
         print(f"[Pipeline] Querying memory store for conversation '{conversation_id}'...")
         subgraph = self.retriever.retrieve(conversation_id, query_clean, k=k)
         
-        # 4. If memory exists, project it to KV cache using MEN
+        # 4. If memory exists and mode is 'inject', project it to KV cache using MEN
         past_key_values = None
         memory_length = 0  # Track how many memory tokens are injected
-        if subgraph["triples"]:
+        if mode == "inject" and subgraph["triples"]:
             print(f"[Pipeline] Extracted {len(subgraph['triples'])} relevant triples. Encoding memory...")
             
             # Encode triples as: [enc(subj || pred); enc(obj)]
@@ -153,12 +153,16 @@ class CGMPipeline:
                     print(f"[Pipeline] Memory KV cache created: {memory_length} memory positions across {len(raw_kv_tuples)} layers.")
                     
         # 5. Build prompt
-        # We append the summarized text context to the prompt
+        # We append the summarized text context or the semantic triples to the prompt based on mode
         summary = subgraph.get("summary", "")
-        if summary:
-            prompt = f"Distilled Past Context: {summary}\n\nUser: {query_clean}\nAssistant:"
+        if mode == "text":
+            triples_text = ", ".join([f"({t[0]} {t[1]} {t[2]})" for t in subgraph.get("triples", [])])
+            prompt = f"Distilled Past Context: {summary}\nSemantic Memory: {triples_text}\n\nUser: {query_clean}\nAssistant:"
         else:
-            prompt = f"User: {query_clean}\nAssistant:"
+            if summary:
+                prompt = f"Distilled Past Context: {summary}\n\nUser: {query_clean}\nAssistant:"
+            else:
+                prompt = f"User: {query_clean}\nAssistant:"
             
         # 6. Run generation under GPU lock
         print("[Pipeline] Executing LLM generation...")

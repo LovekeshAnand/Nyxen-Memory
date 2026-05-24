@@ -26,6 +26,29 @@ def interactive_chat():
     print(" directly into the LLM's KV cache, completely discarding raw history!")
     print("=" * 70)
     
+    print(" Select your Inference Mode:")
+    print("  [1] Plain-Text Graph RAG (Phase 1 Baseline):")
+    print("      Passes retrieved graph triples as text in the prompt.")
+    print("      Guarantees 100% coherent outputs using the model's native weights.")
+    print("  [2] Active Cache Injection (Early Phase 2 Prototype):")
+    print("      Injects synthetic KV cache from the untrained MEN network.")
+    print("      Demonstrates the out-of-distribution 'Memory Noise' effect.")
+    print("=" * 70)
+    
+    chat_mode = "text"
+    while True:
+        choice = input("Enter mode choice [1 or 2, default 1]: ").strip()
+        if not choice or choice == "1":
+            chat_mode = "text"
+            print("Selected: Plain-Text Graph RAG Mode.\n")
+            break
+        elif choice == "2":
+            chat_mode = "inject"
+            print("Selected: Active Cache Injection Mode.\n")
+            break
+        else:
+            print("Invalid selection. Enter 1 or 2.")
+
     db_path = "data/cgm_memory.db"
     conversation_id = "interactive_user_session"
     
@@ -89,7 +112,7 @@ def interactive_chat():
             # 1. Run Pipeline generation (retrieves triples, encodes, injects KV cache, generates)
             print("[CGM] Querying graph store, extracting matching triples, and injecting KV cache...")
             start_time = time.perf_counter()
-            response = pipeline.generate(conversation_id, user_input, k=10, max_new_tokens=60)
+            response = pipeline.generate(conversation_id, user_input, k=10, max_new_tokens=60, mode=chat_mode)
             latency = time.perf_counter() - start_time
             
             print(f"\n🤖 CGM-GPT2: {response}")
