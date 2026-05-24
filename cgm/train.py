@@ -53,9 +53,22 @@ class MEGATrainer:
             inputs_mask = torch.ones_like(inputs)
             attention_mask = torch.cat([memory_mask, inputs_mask], dim=-1)
             
+            # Start absolute positions after the memory keys/values to avoid position overlap
+            position_ids = torch.arange(
+                memory_length, 
+                memory_length + inputs.shape[-1], 
+                dtype=torch.long, 
+                device=self.pipeline.device
+            ).unsqueeze(0).expand(inputs.shape[0], -1)
+            
             # Forward pass through frozen LLM
-            # We pass the synthetic KV cache and combined attention mask
-            outputs = self.pipeline.model(inputs, past_key_values=past_key_values, attention_mask=attention_mask)
+            # We pass the synthetic KV cache, combined attention mask, and shifted position IDs
+            outputs = self.pipeline.model(
+                inputs, 
+                past_key_values=past_key_values, 
+                attention_mask=attention_mask,
+                position_ids=position_ids
+            )
             
             # 3. Compute loss
             # We calculate cross-entropy loss strictly on the target_ids tokens

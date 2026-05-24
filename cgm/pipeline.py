@@ -167,12 +167,22 @@ class CGMPipeline:
         # Check input bounds for token length
         InputBufferGuard.validate_tensor_bounds(inputs.input_ids.shape[1])
         
-        # Build attention mask that covers both injected memory positions and prompt tokens
+        # Build attention mask and position IDs that cover both injected memory positions and prompt tokens
+        position_ids = None
         if past_key_values is not None and memory_length > 0:
             # The model needs to attend to: [memory_positions] + [prompt_tokens]
             # Memory positions get attention=1 (the model should attend to them)
             memory_mask = torch.ones(1, memory_length, dtype=torch.long, device=self.device)
             full_attention_mask = torch.cat([memory_mask, inputs.attention_mask], dim=-1)
+            
+            # Start absolute positions after the memory keys/values to avoid position overlap
+            prompt_length = inputs.input_ids.shape[1]
+            position_ids = torch.arange(
+                memory_length, 
+                memory_length + prompt_length, 
+                dtype=torch.long, 
+                device=self.device
+            ).unsqueeze(0)
         else:
             full_attention_mask = inputs.attention_mask
         
@@ -183,7 +193,8 @@ class CGMPipeline:
                     past_key_values=past_key_values,
                     max_new_tokens=max_new_tokens,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    attention_mask=full_attention_mask
+                    attention_mask=full_attention_mask,
+                    position_ids=position_ids
                 )
                 
         # 7. Decode and return response
