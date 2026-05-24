@@ -31,9 +31,8 @@ class SubgraphRetriever:
                 
             print(f"[Retriever] Loading SentenceTransformer '{self.embedding_model_name}' on device: {self.device}...")
             
-            # Protect GPU loading
-            with GPULockManager():
-                self._embedder = SentenceTransformer(self.embedding_model_name, device=self.device)
+            # Load the model directly (the caller embed_text already holds the GPULockManager context)
+            self._embedder = SentenceTransformer(self.embedding_model_name, device=self.device)
                 
         return self._embedder
 
