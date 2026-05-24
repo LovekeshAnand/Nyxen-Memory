@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from typing import Dict, Any, List
+from transformers.cache_utils import DynamicCache
 from cgm.schema import SQLiteGraphStore
 from cgm.retriever import SubgraphRetriever
 from cgm.model import MemoryEncoderNetwork
@@ -36,16 +37,23 @@ class MEGATrainer:
             optimizer.zero_grad()
 
             # 1. MEN projects triples to synthetic KV cache
-            past_key_values = self.pipeline.men(x_triples)
+            raw_kv_tuples = self.pipeline.men(x_triples)
+            past_key_values = DynamicCache.from_legacy_cache(tuple(raw_kv_tuples))
 
             # 2. Prepare inputs for LLM forward pass
             # We concatenate the prompt_ids and target_ids
             # inputs shape: (batch_size, prompt_len + target_len)
             inputs = torch.cat([prompt_ids, target_ids], dim=-1).to(self.pipeline.device)
             
+            # Build attention mask that covers both injected memory positions and input tokens
+            memory_length = x_triples.shape[1]
+            memory_mask = torch.ones(inputs.shape[0], memory_length, dtype=torch.long, device=self.pipeline.device)
+            inputs_mask = torch.ones_like(inputs)
+            attention_mask = torch.cat([memory_mask, inputs_mask], dim=-1)
+            
             # Forward pass through frozen LLM
-            # We pass the synthetic KV cache
-            outputs = self.pipeline.model(inputs, past_key_values=past_key_values)
+            # We pass the synthetic KV cache and combined attention mask
+            outputs = self.pipeline.model(inputs, past_key_values=past_key_values, attention_mask=attention_mask)
             
             # 3. Compute loss
             # We calculate cross-entropy loss strictly on the target_ids tokens
