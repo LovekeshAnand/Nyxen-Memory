@@ -5,3 +5,7 @@ accelerate
 numpy
 python-dotenv
 requests
+turbovec
+matplotlib
+networkx
+scikit-learn
