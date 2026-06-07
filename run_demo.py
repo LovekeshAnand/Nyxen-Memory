@@ -1,25 +1,23 @@
 import os
 import sys
-
-# Support running directly from inside the cgm directory or root
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
-
 import time
-from cgm.schema import SQLiteGraphStore, HybridMemoryObject
-from cgm.pipeline import CGMPipeline
-from cgm.train import MEGATrainer
 
-def seed_database(store: SQLiteGraphStore, conversation_id: str):
+# Ensure root directory is in sys.path
+root_dir = os.path.dirname(os.path.abspath(__file__))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+
+from cgm.database.schema import SQLiteGraphStore, HybridMemoryObject
+from cgm.core.pipeline import CGMPipeline
+from cgm.training.train import MEGATrainer
+
+def seed_database(pipeline: CGMPipeline, conversation_id: str):
     """
-    Seeds the SQLite database store with the dialogue history from Scenario 1
-    (FastAPI / PostgreSQL setup preferences).
+    Seeds the SQLite database store with dense turn representations and semantic triples
+    representing the dialogue history.
     """
     print(f"[Demo] Seeding database store for conversation '{conversation_id}'...")
     
-    # Define past turns (representing turns 1 to 5)
     summary = (
         "The user is setting up a backend API using FastAPI. "
         "They have configured the database as PostgreSQL on port 8080. "
@@ -28,7 +26,6 @@ def seed_database(store: SQLiteGraphStore, conversation_id: str):
         "They also prefer Ruff for formatting with a max line length of 100 characters."
     )
     
-    # Extract semantic triples manually to represent the compiled graph
     triples = [
         ["Project", "uses", "FastAPI"],
         ["Database", "connects_to", "PostgreSQL"],
@@ -52,23 +49,41 @@ def seed_database(store: SQLiteGraphStore, conversation_id: str):
         {"name": "Ruff", "type": "Technology", "description": "Formatter and linter tool"}
     ]
     
-    # Create the Hybrid Memory Object (HMO)
-    hmo = HybridMemoryObject(
-        turn_id=1,
-        timestamp=time.time(),
-        summary=summary,
-        triples=triples,
-        entities=entities,
-        # Create small dummy embeddings since retriever will embed on the fly
-        sentence_embeddings=None,
-        conversation_embedding=None,
-        episodic_events=[{"event": "db_config_locked", "status": "completed"}],
-        uncertainty_scores={"asyncpg_choice": 1.0}
+    # Store turn using retriever (embeds text and updates SQLite + TurboVec)
+    turn_text = (
+        "We are setting up a backend FastAPI API project. The database connects to PostgreSQL "
+        "on Port 8080 using asyncpg for asynchronous connectivity. The project uses typing_extensions "
+        "and Pydantic v2 for validation, with user_profiles as a database table. Code is formatted by "
+        "Ruff with a max line length setting of 100."
     )
     
-    # Save hmo to DB store
-    store.save_hmo(conversation_id, hmo)
-    print("[Demo] Database successfully seeded.")
+    pipeline.retriever.store_turn(
+        conversation_id=conversation_id,
+        turn_id=1,
+        text=turn_text,
+        summary=summary,
+        user_text="What backend stack setup did we decide on?",
+        assistant_text=f"FastAPI with PostgreSQL on port 8080 using asyncpg. Validation is via Pydantic v2 and code is formatted with Ruff."
+    )
+    
+    # Save triples and entities to SQLite for concept map visualization
+    with pipeline.store._lock:
+        conn = pipeline.store._get_connection()
+        cursor = conn.cursor()
+        for ent in entities:
+            cursor.execute("""
+                INSERT OR REPLACE INTO entities (conversation_id, name, type, description)
+                VALUES (?, ?, ?, ?)
+            """, (conversation_id, ent["name"], ent["type"], ent["description"]))
+        for trip in triples:
+            cursor.execute("""
+                INSERT OR REPLACE INTO triples (conversation_id, turn_id, subject, predicate, object)
+                VALUES (?, 1, ?, ?, ?)
+            """, (conversation_id, trip[0], trip[1], trip[2]))
+        conn.commit()
+        conn.close()
+        
+    print("[Demo] Database successfully seeded with RAG embeddings and graph structures.")
 
 
 def main():
@@ -78,27 +93,27 @@ def main():
     
     conversation_id = "test_conversation_99"
     db_path = "data/cgm_memory.db"
+    index_path = "data/cgm_rag.tvim"
     
-    # Clean up old database if exists to ensure clean run
-    if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-            print("[Demo] Removed old cgm_memory.db database for a clean run.")
-        except Exception:
-            pass
-            
-    # 1. Seed database FIRST (before loading heavy models)
-    # We create the store directly to avoid triggering the pipeline's lazy model load
-    store = SQLiteGraphStore(db_path)
-    seed_database(store, conversation_id)
-    
-    # 2. Initialize Pipeline (targeting GPT-2 as a lightweight model for CPU/GPU)
+    # Clean up old database and index to ensure a clean run
+    for filepath in [db_path, index_path]:
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                print(f"[Demo] Removed old {filepath} for a clean run.")
+            except Exception:
+                pass
+                
+    # 1. Initialize Pipeline (targeting GPT-2 as a lightweight model for CPU/GPU)
     # Automatically runs on NVIDIA RTX A2000 (CUDA) if available
     pipeline = CGMPipeline(model_name="gpt2", db_path=db_path)
     
-    # 3. Initialize Model and Tokenizer (loads everything once)
+    # 2. Initialize Model and Tokenizer (loads everything once)
     print("\n[Demo] Initializing models and allocating GPU memory...")
     pipeline.initialize()
+    
+    # 3. Seed database after initialization using the loaded pipeline
+    seed_database(pipeline, conversation_id)
     
     # 4. Run Proof-of-Concept Adapter Training
     # Shows backprop updating the linear KV adapters under active thermal guards

@@ -1,7 +1,7 @@
 import numpy as np
 from typing import Dict, Any, List
-from cgm.schema import SQLiteGraphStore
-from cgm.safety import GPULockManager
+from cgm.database.schema import SQLiteGraphStore
+from cgm.safety.safety import GPULockManager
 
 class SubgraphRetriever:
     """
@@ -44,6 +44,16 @@ class SubgraphRetriever:
             embedding = self.embedder.encode(text, convert_to_numpy=True)
         return embedding
 
+    def embed_texts(self, texts: List[str]) -> np.ndarray:
+        """
+        Computes the dense vector representations of a list of strings in a single batch.
+        """
+        if not texts:
+            return np.empty((0, 384), dtype=np.float32)
+        with GPULockManager():
+            embeddings = self.embedder.encode(texts, convert_to_numpy=True)
+        return embeddings
+
     def retrieve(self, conversation_id: str, query_text: str, k: int = 20, 
                  alpha: float = 0.5, beta: float = 0.3, gamma: float = 0.2, 
                  decay_rate: float = 0.1) -> Dict[str, Any]:
@@ -68,20 +78,23 @@ class SubgraphRetriever:
         # 2. Get summaries and their turn IDs
         current_turn = max(t["turn_id"] for t in turns) if turns else 1
         
-        # Build turn summaries lookup & embed summaries
+        # Build turn summaries lookup & batch embed summaries
         turn_summaries = {t["turn_id"]: t["summary"] for t in turns}
-        turn_embeddings = {}
-        for turn_id, summary in turn_summaries.items():
-            turn_embeddings[turn_id] = self.embed_text(summary)
+        turn_ids_list = list(turn_summaries.keys())
+        summaries_list = [turn_summaries[tid] for tid in turn_ids_list]
+        
+        summary_embeddings = self.embed_texts(summaries_list) # shape: (num_turns, 384)
+        turn_embeddings = {tid: summary_embeddings[idx] for idx, tid in enumerate(turn_ids_list)}
 
         # 3. Score each triple
+        # Collect all triple texts for batch embedding
+        trip_texts = [f"{trip['subject']} {trip['predicate']} {trip['object']}" for trip in triples]
+        trip_embeddings = self.embed_texts(trip_texts) # shape: (num_triples, 384)
+        
         scored_triples = []
-        for trip in triples:
+        for idx, trip in enumerate(triples):
             turn_id = trip["turn_id"]
-            
-            # Format triple as sentence for similarity comparison
-            trip_text = f"{trip['subject']} {trip['predicate']} {trip['object']}"
-            trip_embed = self.embed_text(trip_text)
+            trip_embed = trip_embeddings[idx]
             
             # Calculate cosine similarities
             # similarity = (A . B) / (||A|| * ||B||)

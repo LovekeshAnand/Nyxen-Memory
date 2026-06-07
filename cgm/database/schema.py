@@ -22,6 +22,9 @@ class HybridMemoryObject:
     conversation_embedding: Optional[np.ndarray] = None  # shape: (d_embed,)
     episodic_events: List[Dict[str, Any]] = field(default_factory=list)
     uncertainty_scores: Dict[str, float] = field(default_factory=dict)
+    user_text: Optional[str] = None
+    assistant_text: Optional[str] = None
+    raw_embedding: Optional[np.ndarray] = None
 
 
 class SQLiteGraphStore:
@@ -58,12 +61,24 @@ class SQLiteGraphStore:
                     turn_id INTEGER,
                     timestamp REAL,
                     summary TEXT,
+                    user_text TEXT,
+                    assistant_text TEXT,
                     episodic_events TEXT,
                     uncertainty_scores TEXT,
                     PRIMARY KEY (conversation_id, turn_id)
                 )
             """)
             
+            # Migration helper for pre-existing database tables
+            try:
+                cursor.execute("ALTER TABLE turns ADD COLUMN user_text TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("ALTER TABLE turns ADD COLUMN assistant_text TEXT")
+            except sqlite3.OperationalError:
+                pass
+
             # 2. Entity nodes table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS entities (
@@ -100,6 +115,17 @@ class SQLiteGraphStore:
                     PRIMARY KEY (conversation_id, turn_id, embedding_type)
                 )
             """)
+
+            # 5. Turn-level dense embeddings storage for RAG pipeline
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS turn_embeddings (
+                    conversation_id TEXT,
+                    turn_id INTEGER,
+                    data BLOB,
+                    dim INTEGER,
+                    PRIMARY KEY (conversation_id, turn_id)
+                )
+            """)
             
             conn.commit()
             conn.close()
@@ -130,13 +156,15 @@ class SQLiteGraphStore:
                 # Insert Turn metadata
                 cursor.execute("""
                     INSERT OR REPLACE INTO turns 
-                    (conversation_id, turn_id, timestamp, summary, episodic_events, uncertainty_scores)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (conversation_id, turn_id, timestamp, summary, user_text, assistant_text, episodic_events, uncertainty_scores)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     conversation_id,
                     hmo.turn_id,
                     hmo.timestamp,
                     hmo.summary,
+                    hmo.user_text,
+                    hmo.assistant_text,
                     json.dumps(hmo.episodic_events),
                     json.dumps(hmo.uncertainty_scores)
                 ))
@@ -168,10 +196,62 @@ class SQLiteGraphStore:
                             VALUES (?, ?, ?, ?, ?)
                         """, (conversation_id, hmo.turn_id, embed_type, dims_str, data_bytes))
                 
+                # Insert turn-level raw embedding if present
+                if hmo.raw_embedding is not None:
+                    arr_f32 = hmo.raw_embedding.astype(np.float32)
+                    data_bytes = arr_f32.tobytes()
+                    dim = arr_f32.shape[-1]
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO turn_embeddings (conversation_id, turn_id, data, dim)
+                        VALUES (?, ?, ?, ?)
+                    """, (conversation_id, hmo.turn_id, data_bytes, dim))
+
                 conn.commit()
             except Exception as e:
                 conn.rollback()
                 raise e
+            finally:
+                conn.close()
+
+    def save_turn_embedding(self, conversation_id: str, turn_id: int, embedding: np.ndarray):
+        """
+        Saves a turn-level embedding (384-dim) for a conversation turn.
+        """
+        with self._lock:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            try:
+                arr_f32 = embedding.astype(np.float32)
+                data_bytes = arr_f32.tobytes()
+                dim = arr_f32.shape[-1]
+                cursor.execute("""
+                    INSERT OR REPLACE INTO turn_embeddings (conversation_id, turn_id, data, dim)
+                    VALUES (?, ?, ?, ?)
+                """, (conversation_id, turn_id, data_bytes, dim))
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                raise e
+            finally:
+                conn.close()
+
+    def get_turn_embedding(self, conversation_id: str, turn_id: int) -> np.ndarray:
+        """
+        Retrieves the turn-level embedding for a conversation turn.
+        """
+        with self._lock:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    SELECT data, dim FROM turn_embeddings
+                    WHERE conversation_id = ? AND turn_id = ?
+                """, (conversation_id, turn_id))
+                row = cursor.fetchone()
+                if row is None:
+                    raise KeyError(f"No turn embedding found for conversation '{conversation_id}', turn {turn_id}")
+                arr = np.frombuffer(row["data"], dtype=np.float32)
+                return arr.reshape((row["dim"],))
             finally:
                 conn.close()
 

@@ -5,11 +5,11 @@ import torch.optim as optim
 import numpy as np
 from typing import Dict, Any, List
 from transformers.cache_utils import DynamicCache
-from cgm.schema import SQLiteGraphStore
-from cgm.retriever import SubgraphRetriever
-from cgm.model import MemoryEncoderNetwork
-from cgm.pipeline import CGMPipeline
-from cgm.safety import GPULockManager, GPUMemoryGuard, ThermalGuard
+from cgm.database.schema import SQLiteGraphStore
+from cgm.retrieval.retriever import SubgraphRetriever
+from cgm.core.model import MemoryEncoderNetwork
+from cgm.core.pipeline import CGMPipeline
+from cgm.safety.safety import GPULockManager, GPUMemoryGuard, ThermalGuard
 
 class MEGATrainer:
     """
@@ -37,14 +37,12 @@ class MEGATrainer:
             optimizer.zero_grad()
 
             raw_kv_tuples = self.pipeline.men(x_triples)
-            # Convert raw tuples to DynamicCache (compatible with all transformers versions)
+            # Convert raw tuples to DynamicCache
             past_key_values = DynamicCache()
             for idx, (k, v) in enumerate(raw_kv_tuples):
                 past_key_values.update(k, v, idx)
 
             # 2. Prepare inputs for LLM forward pass
-            # We concatenate the prompt_ids and target_ids
-            # inputs shape: (batch_size, prompt_len + target_len)
             inputs = torch.cat([prompt_ids, target_ids], dim=-1).to(self.pipeline.device)
             
             # Build attention mask that covers both injected memory positions and input tokens
@@ -62,7 +60,6 @@ class MEGATrainer:
             ).unsqueeze(0).expand(inputs.shape[0], -1)
             
             # Forward pass through frozen LLM
-            # We pass the synthetic KV cache, combined attention mask, and shifted position IDs
             outputs = self.pipeline.model(
                 inputs, 
                 past_key_values=past_key_values, 
@@ -71,17 +68,13 @@ class MEGATrainer:
             )
             
             # 3. Compute loss
-            # We calculate cross-entropy loss strictly on the target_ids tokens
             logits = outputs.logits
             
             # Align logits and targets for loss calculation
-            # Logits shape: (batch, seq_len, vocab_size)
             prompt_len = prompt_ids.shape[-1]
             target_len = target_ids.shape[-1]
             
             # We slice logits corresponding to the target tokens
-            # We want to predict target_ids[t] given input prefix + target_ids[:t]
-            # So we take logits from index (prompt_len - 1) to (prompt_len + target_len - 2)
             shift_logits = logits[..., prompt_len - 1 : prompt_len + target_len - 1, :].contiguous()
             shift_labels = target_ids.contiguous()
             
@@ -112,7 +105,6 @@ class MEGATrainer:
         optimizer = optim.AdamW(self.pipeline.men.parameters(), lr=self.lr)
         
         # Define synthetic training sample
-        # 3 triples representing database configurations
         dummy_triples = [
             ["Project", "uses", "FastAPI"],
             ["Database", "connects_to", "PostgreSQL"],
@@ -120,10 +112,17 @@ class MEGATrainer:
         ]
         
         # Encode triples into MEN input shape (1, 3, 768)
-        x_list = []
+        texts_to_embed = []
         for trip in dummy_triples:
-            sp_vector = self.pipeline.retriever.embed_text(f"{trip[0]} {trip[1]}")
-            o_vector = self.pipeline.retriever.embed_text(trip[2])
+            texts_to_embed.append(f"{trip[0]} {trip[1]}")
+            texts_to_embed.append(trip[2])
+            
+        embeddings = self.pipeline.retriever.embed_texts(texts_to_embed) # shape: (6, 384)
+        
+        x_list = []
+        for idx in range(len(dummy_triples)):
+            sp_vector = embeddings[2 * idx]
+            o_vector = embeddings[2 * idx + 1]
             x_i = np.concatenate([sp_vector, o_vector])
             x_list.append(x_i)
             
@@ -131,8 +130,6 @@ class MEGATrainer:
         x_tensor = torch.tensor(x_arr, dtype=torch.float32).unsqueeze(0).to(self.pipeline.device)
         
         # Dummy Prompt and Target responses
-        # Turn 6 Query: "Generate code for postgres db config"
-        # Turn 6 Target: "Here is your FastAPI PostgreSQL configuration running on port 8080 using asyncpg."
         prompt_text = "User: Generate code for postgres db config\nAssistant:"
         target_text = "Here is your FastAPI PostgreSQL configuration running on port 8080 using asyncpg."
         
