@@ -159,13 +159,6 @@ The visualization system runs a background HTTP server (port 8050) and launches 
 * **Problem:** TurboVec indices enforce unique vector IDs. When multiple sessions or scripts stored their history, they collided on starting turn IDs (like `turn_id=1`), raising duplicate ID errors.
 * **Solution:** Created a stable 64-bit ID hashing scheme (`encode_id`) that combines the hash of the `conversation_id` and the `turn_id` into a single unsigned 64-bit integer. The upper 48 bits contain a stable SHA-256 hash of the conversation name, and the lower 16 bits contain the turn number. This isolates conversations in the shared vector file index.
 
-### Disk Space Protection
-* **Problem:** Workstation C: drives can be severely low on space. Standard Hugging Face cache and Ollama download paths default to the C: drive user profile, leading to disk exhaustion.
-* **Solution:** 
-  * The environment variable `HF_HOME` is redirected to `d:/huggingface_cache` inside the package initialization code.
-  * The environment variable `OLLAMA_MODELS` is set at the user profile level to download and run local LLMs from `d:\OllamaModels` (145 GB free).
-  * Reclaimed over 5 GB of space by clearing the C: drive local NPM caches.
-
 ---
 
 ## Performance Benchmarks
