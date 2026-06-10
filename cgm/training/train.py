@@ -20,7 +20,7 @@ class MEGATrainer:
     def __init__(self, pipeline: CGMPipeline, lr: float = 1e-4):
         self.pipeline = pipeline
         self.lr = lr
-        self.thermal_guard = ThermalGuard(batch_limit_before_cooldown=5, cooldown_seconds=2.0)
+        self.thermal_guard = ThermalGuard(target_temp_c=75.0, max_temp_c=85.0)
         self.mem_guard = GPUMemoryGuard()
 
     def train_step(self, x_triples: torch.Tensor, prompt_ids: torch.Tensor, 

@@ -45,12 +45,29 @@ fi
 
 # 4. Configure Storage Paths (redirecting to D: drive if present to prevent C: drive exhaustion)
 if [[ "$OS_TYPE" == "windows" ]]; then
+    IS_D_LOCAL_FIXED=false
     if [ -d "/d" ] || [ -d "D:\\" ] || [ -d "D:/" ]; then
-        echo "[System] D: drive detected. Configuring redirects to D: drive to prevent C: drive exhaustion..."
+        if command -v powershell.exe &> /dev/null; then
+            D_TYPE=$(powershell.exe -Command "(Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='D:'\" -ErrorAction SilentlyContinue).DriveType" 2>/dev/null | tr -d '\r\n[:space:]')
+            if [ -z "$D_TYPE" ]; then
+                D_TYPE=$(powershell.exe -Command "(Get-WmiObject Win32_LogicalDisk -Filter \"DeviceID='D:'\" -ErrorAction SilentlyContinue).DriveType" 2>/dev/null | tr -d '\r\n[:space:]')
+            fi
+            if [ "$D_TYPE" = "3" ]; then
+                IS_D_LOCAL_FIXED=true
+            else
+                echo "[System] D: drive detected but it is not a local fixed disk (DriveType: ${D_TYPE:-Unknown}). Skipping redirect to avoid network share bottlenecks."
+            fi
+        else
+            echo "[System] D: drive detected, but powershell.exe not found to verify drive type. Skipping redirect."
+        fi
+    fi
+
+    if [ "$IS_D_LOCAL_FIXED" = true ]; then
+        echo "[System] Local fixed D: drive detected. Configuring redirects to D: drive to prevent C: drive exhaustion..."
         OLLAMA_TARGET="D:\\OllamaModels"
         HF_TARGET="D:\\huggingface_cache"
     else
-        echo "[System] D: drive not detected. Falling back to C: drive user directory..."
+        echo "[System] Using default user directory storage on C: drive..."
         OLLAMA_TARGET="$HOME\\OllamaModels"
         HF_TARGET="$HOME\\.cache\\huggingface"
     fi
@@ -143,7 +160,39 @@ if [ "$SERVER_ACTIVE" = true ]; then
     fi
 fi
 
-# 8. Warm up SentenceTransformer Cache
+# 8. Compile Rust Speedups Library
+echo "[System] Checking for Rust/Cargo installation..."
+if command -v cargo &> /dev/null; then
+    echo "[System] Cargo detected. Compiling Rust speedups library from source..."
+    (
+        cd "$(dirname "$0")/cgm_rust_speedups"
+        cargo build --release
+    )
+    
+    # Copy based on OS
+    if [[ "$OS_TYPE" == "windows" ]]; then
+        DLL_SRC="$(dirname "$0")/cgm_rust_speedups/target/release/cgm_rust_speedups.dll"
+        DLL_DST="$(dirname "$0")/cgm/safety/cgm_rust_speedups.dll"
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        DLL_SRC="$(dirname "$0")/cgm_rust_speedups/target/release/libcgm_rust_speedups.dylib"
+        DLL_DST="$(dirname "$0")/cgm/safety/libcgm_rust_speedups.dylib"
+    else
+        DLL_SRC="$(dirname "$0")/cgm_rust_speedups/target/release/libcgm_rust_speedups.so"
+        DLL_DST="$(dirname "$0")/cgm/safety/libcgm_rust_speedups.so"
+    fi
+    
+    if [ -f "$DLL_SRC" ]; then
+        mkdir -p "$(dirname "$0")/cgm/safety"
+        cp "$DLL_SRC" "$DLL_DST"
+        echo "[System] Successfully compiled and deployed: $DLL_DST"
+    else
+        echo "[Warning] Compiled binary not found at: $DLL_SRC"
+    fi
+else
+    echo "[System] Cargo not found. Skipping Rust compilation; the pipeline will fall back to pure Python implementations."
+fi
+
+# 9. Warm up SentenceTransformer Cache
 echo "[Pipeline] Downloading and warming up SentenceTransformer weights..."
 python -c "
 import os

@@ -11,9 +11,18 @@ logger = logging.getLogger("cgm.safety")
 # Global Re-entrant Thread Lock to serialize GPU access
 _gpu_lock = threading.RLock()
 
-# Load C++ dynamic library for high-performance memory queries and similarity operations
+# Load Rust dynamic library for high-performance memory queries, similarity, and thermals
 _dll = None
-_dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "safety_guard.dll")
+_dll_name = "cgm_rust_speedups.dll"
+if os.name != "nt":
+    import platform
+    if platform.system() == "Darwin":
+        _dll_name = "libcgm_rust_speedups.dylib"
+    else:
+        _dll_name = "libcgm_rust_speedups.so"
+
+_dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _dll_name)
+
 if os.path.exists(_dll_path):
     try:
         _dll = ctypes.CDLL(_dll_path)
@@ -23,9 +32,60 @@ if os.path.exists(_dll_path):
         _dll.get_gpu_vram.restype = ctypes.c_int
         _dll.compute_cosine_similarity.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_int]
         _dll.compute_cosine_similarity.restype = ctypes.c_float
-        logger.info(f"[Safety] Loaded C++ dynamic library: {_dll_path}")
+        _dll.get_gpu_temperature.argtypes = [ctypes.POINTER(ctypes.c_uint)]
+        _dll.get_gpu_temperature.restype = ctypes.c_int
+        logger.info(f"[Safety] Loaded Rust speedups library: {_dll_path}")
     except Exception as e:
-        logger.error(f"[Safety] Failed to load C++ DLL: {e}")
+        logger.error(f"[Safety] Failed to load Rust speedups library: {e}")
+else:
+    logger.info("[Safety] Rust speedups library not found. Using pure Python fallback implementations.")
+
+def get_system_ram_info() -> Tuple[int, int]:
+    """
+    Returns (free_bytes, total_bytes) of system physical RAM.
+    """
+    if _dll is not None:
+        free_bytes = ctypes.c_ulonglong(0)
+        total_bytes = ctypes.c_ulonglong(0)
+        res = _dll.get_system_ram(ctypes.byref(free_bytes), ctypes.byref(total_bytes))
+        if res == 0:
+            return free_bytes.value, total_bytes.value
+    try:
+        import psutil
+        vmem = psutil.virtual_memory()
+        return vmem.available, vmem.total
+    except Exception:
+        pass
+    return 0, 0
+
+def get_gpu_vram_info() -> Tuple[int, int]:
+    """
+    Returns (free_bytes, total_bytes) of GPU VRAM.
+    """
+    if _dll is not None:
+        free_bytes = ctypes.c_ulonglong(0)
+        total_bytes = ctypes.c_ulonglong(0)
+        res = _dll.get_gpu_vram(ctypes.byref(free_bytes), ctypes.byref(total_bytes))
+        if res == 0:
+            return free_bytes.value, total_bytes.value
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.mem_get_info()
+    except Exception:
+        pass
+    return 0, 0
+
+def get_gpu_temperature_info() -> int:
+    """
+    Returns current GPU temperature in Celsius, or 0 if query is unsupported/fails.
+    """
+    if _dll is not None:
+        temp = ctypes.c_uint(0)
+        res = _dll.get_gpu_temperature(ctypes.byref(temp))
+        if res == 0:
+            return temp.value
+    return 0
 
 class GPULockManager:
     """
@@ -59,36 +119,15 @@ class GPUMemoryGuard:
 
     def check_vram(self) -> Tuple[int, int]:
         """
-        Queries the GPU driver via C++/NVML DLL, falling back to PyTorch mem_get_info.
-        If PyTorch is not compiled with CUDA or no GPU is available, returns (0, 0).
+        Queries available and total GPU VRAM via Rust/NVML, falling back to PyTorch.
         """
-        if _dll is not None:
-            free_bytes = ctypes.c_ulonglong(0)
-            total_bytes = ctypes.c_ulonglong(0)
-            res = _dll.get_gpu_vram(ctypes.byref(free_bytes), ctypes.byref(total_bytes))
-            if res == 0:
-                return free_bytes.value, total_bytes.value
-                
-        try:
-            import torch
-            if torch.cuda.is_available():
-                free_bytes, total_bytes = torch.cuda.mem_get_info()
-                return free_bytes, total_bytes
-        except ImportError:
-            pass
-        return 0, 0
+        return get_gpu_vram_info()
 
     def check_system_ram(self) -> Tuple[int, int]:
         """
-        Queries system physical RAM via C++ Win32 API.
+        Queries available and total system physical RAM.
         """
-        if _dll is not None:
-            free_bytes = ctypes.c_ulonglong(0)
-            total_bytes = ctypes.c_ulonglong(0)
-            res = _dll.get_system_ram(ctypes.byref(free_bytes), ctypes.byref(total_bytes))
-            if res == 0:
-                return free_bytes.value, total_bytes.value
-        return 0, 0
+        return get_system_ram_info()
 
     def enforce_safety(self, model_size_est_mb: float = 0.0):
         """
@@ -127,24 +166,49 @@ class GPUMemoryGuard:
 class ThermalGuard:
     """
     Prevents laptop workstation GPUs from overheating under sustained heavy training load.
-    Inserts periodic cooling rests during iterative runs.
+    Instead of hard pauses (which cause sudden temperature drops and thermal cycling stresses
+    due to mismatched coefficients of thermal expansion), it implements a dynamic, proportional
+    pacing control loop that introduces tiny, smooth micro-delays to keep the temperature stable.
     """
-    def __init__(self, batch_limit_before_cooldown: int = 50, cooldown_seconds: float = 3.0):
-        self.batch_limit = batch_limit_before_cooldown
-        self.cooldown_seconds = cooldown_seconds
-        self.batch_count = 0
-        self.last_cooldown_time = time.time()
+    def __init__(self, target_temp_c: float = 75.0, max_temp_c: float = 85.0, base_pacing_s: float = 0.005, *args, **kwargs):
+        self.target_temp = target_temp_c
+        self.max_temp = max_temp_c
+        self.base_pacing = base_pacing_s
+        logger.info(f"[Safety] ThermalGuard initialized. Target Temp: {target_temp_c}°C, Max Temp: {max_temp_c}°C.")
 
     def cycle(self):
         """
-        Tracks batches processed. Sleep if limit is reached to allow hardware to cool down.
+        Queries the GPU temperature and applies proportional pacing delay.
         """
-        self.batch_count += 1
-        if self.batch_count >= self.batch_limit:
-            logger.info(f"[Safety] ThermalGuard: Processing limit reached ({self.batch_count} batches). Pausing for {self.cooldown_seconds}s for GPU cool down...")
-            time.sleep(self.cooldown_seconds)
-            self.batch_count = 0
-            self.last_cooldown_time = time.time()
+        current_temp = get_gpu_temperature_info()
+        
+        # If temp query is unavailable (returns 0), fall back to a small base pacing sleep
+        if current_temp == 0:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    time.sleep(self.base_pacing)
+            except ImportError:
+                pass
+            return
+
+        # Proportional thermal throttling pacing
+        if current_temp >= self.target_temp:
+            excess = current_temp - self.target_temp
+            range_temp = max(1.0, self.max_temp - self.target_temp)
+            ratio = min(1.0, excess / range_temp)
+            
+            # Quadratic scaling of delay from 10ms to 300ms
+            pacing_delay = 0.01 + 0.29 * (ratio ** 2)
+            
+            logger.warning(
+                f"[Safety Warning] GPU temperature at {current_temp}°C (target: {self.target_temp}°C). "
+                f"Applying thermal pacing delay of {pacing_delay*1000:.1f}ms."
+            )
+            time.sleep(pacing_delay)
+        else:
+            if self.base_pacing > 0:
+                time.sleep(self.base_pacing)
 
 
 class InputBufferGuard:

@@ -127,7 +127,20 @@ def interactive_chat():
     # Determine the target models path, checking D: drive availability
     models_path = os.environ.get("OLLAMA_MODELS")
     if not models_path:
-        models_path = "D:\\OllamaModels" if os.path.exists("D:\\") else os.path.expanduser("~/.ollama/models")
+        is_local_fixed = False
+        if os.path.exists("D:\\"):
+            is_local_fixed = True
+            if os.name == 'nt':
+                import ctypes
+                try:
+                    drive_type = ctypes.windll.kernel32.GetDriveTypeW("D:\\")
+                    is_local_fixed = (drive_type == 3) # 3 = DRIVE_FIXED
+                except Exception:
+                    is_local_fixed = False
+        if is_local_fixed:
+            models_path = "D:\\OllamaModels"
+        else:
+            models_path = os.path.expanduser("~/.ollama/models")
         
     # 1. Verify / Launch Ollama Server
     print("[Ollama] Checking connection to local Ollama server...")

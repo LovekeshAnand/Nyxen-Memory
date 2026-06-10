@@ -44,12 +44,30 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
 $ollamaPath = "$Home\OllamaModels"
 $hfPath = "$Home\.cache\huggingface"
 
+$isDLocalFixed = $false
 if (Test-Path "D:\") {
-    Write-Output "[System] D: drive detected. Configuring redirects to D: drive to prevent C: drive exhaustion..."
+    try {
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='D:'" -ErrorAction SilentlyContinue
+        if ($null -eq $disk) {
+            $disk = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='D:'" -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $disk -and $disk.DriveType -eq 3) {
+            $isDLocalFixed = $true
+        } else {
+            $driveTypeStr = if ($null -ne $disk) { $disk.DriveType } else { "Unknown" }
+            Write-Output "[System] D: drive detected but it is not a local fixed disk (DriveType: $driveTypeStr). Skipping redirect to avoid network share bottlenecks."
+        }
+    } catch {
+        Write-Output "[System] Warning: Failed to query D: drive type. Defaulting to safe fallback."
+    }
+}
+
+if ($isDLocalFixed) {
+    Write-Output "[System] Local fixed D: drive detected. Configuring redirects to D: drive to prevent C: drive exhaustion..."
     $ollamaPath = "D:\OllamaModels"
     $hfPath = "D:\huggingface_cache"
 } else {
-    Write-Output "[System] D: drive not detected. Falling back to C: drive user directory..."
+    Write-Output "[System] Using default user directory storage on C: drive..."
 }
 
 if (-not (Test-Path $ollamaPath)) {
@@ -154,7 +172,33 @@ if ($serverActive) {
     }
 }
 
-# 8. Warm up SentenceTransformer Cache
+# 8. Compile Rust Speedups Library
+Write-Output "[System] Checking for Rust/Cargo installation..."
+if (Get-Command cargo -ErrorAction SilentlyContinue) {
+    Write-Output "[System] Cargo detected. Compiling Rust speedups library from source..."
+    try {
+        $prevDir = Get-Location
+        $scriptDir = if ($null -ne $PSScriptRoot -and $PSScriptRoot -ne "") { $PSScriptRoot } else { "." }
+        Set-Location "$scriptDir\cgm_rust_speedups"
+        cargo build --release
+        Set-Location $prevDir
+        
+        $dllSrc = "$scriptDir\cgm_rust_speedups\target\release\cgm_rust_speedups.dll"
+        $dllDst = "$scriptDir\cgm\safety\cgm_rust_speedups.dll"
+        if (Test-Path $dllSrc) {
+            Copy-Item -Path $dllSrc -Destination $dllDst -Force
+            Write-Output "[System] Successfully compiled and deployed cgm_rust_speedups.dll"
+        } else {
+            Write-Output "[Warning] Compiled DLL not found at expected location: $dllSrc"
+        }
+    } catch {
+        Write-Output "[Warning] Rust speedups compilation failed: $_"
+    }
+} else {
+    Write-Output "[System] Cargo not found. Skipping Rust compilation; the pipeline will fall back to pure Python implementations."
+}
+
+# 9. Warm up SentenceTransformer Cache
 Write-Output "[Pipeline] Downloading and warming up SentenceTransformer weights..."
 python -c "
 import os

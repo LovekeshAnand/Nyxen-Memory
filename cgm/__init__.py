@@ -2,9 +2,19 @@
 import sys
 import os
 
-# Redirect Hugging Face cache to D: drive if it exists to prevent C: drive exhaustion
-if os.path.exists("D:\\"):
-    os.environ["HF_HOME"] = "d:/huggingface_cache"
+# Redirect Hugging Face cache to D: drive if it exists and is a local fixed disk to prevent C: drive exhaustion
+if "HF_HOME" not in os.environ:
+    if os.path.exists("D:\\"):
+        is_local_fixed = True
+        if os.name == 'nt':
+            import ctypes
+            try:
+                drive_type = ctypes.windll.kernel32.GetDriveTypeW("D:\\")
+                is_local_fixed = (drive_type == 3) # 3 = DRIVE_FIXED
+            except Exception:
+                is_local_fixed = False
+        if is_local_fixed:
+            os.environ["HF_HOME"] = "D:\\huggingface_cache"
 
 # Add custom PyTorch CUDA path if it exists
 cuda_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".torch_cuda")
