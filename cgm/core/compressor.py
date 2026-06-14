@@ -5,6 +5,7 @@ import threading
 from typing import Dict, Any, List, Optional, Tuple
 from transformers.cache_utils import DynamicCache
 from cgm.safety.safety import GPULockManager, GPUMemoryGuard
+import torch.nn.functional as F
 
 logger = logging.getLogger("cgm.compressor")
 
@@ -41,10 +42,12 @@ class KVCompressor:
     Evaluates key-value token importance based on attention history, and dynamically
     evicts/clusters cold-zone entries under strict safety locks and CUDA streams.
     """
-    def __init__(self, hot_window: int = 64, kl_threshold: float = 0.05, check_interval_sec: float = 2.0):
+    def __init__(self, hot_window: int = 64, kl_threshold: float = 0.05, 
+                 check_interval_sec: float = 2.0, fidelity_mode: str = "cosine"):
         self.hot_window = hot_window
         self.kl_threshold = kl_threshold
         self.check_interval_sec = check_interval_sec
+        self.fidelity_mode = fidelity_mode  # 'cosine' (fast, no LLM pass) or 'kl' (accurate, 2 LLM passes)
         self.running = False
         self._thread = None
         self._cuda_stream = None
@@ -172,20 +175,40 @@ class KVCompressor:
                 else:
                     cluster_groups[-1].append(i)
                     
+        # Check if model has rotary embeddings
+        has_rotary = hasattr(pipeline.model.model, "rotary_emb")
+        if has_rotary:
+            pos_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+            dummy_x = torch.zeros(1, 1, seq_len, pipeline.model.config.hidden_size // pipeline.model.config.num_attention_heads).to(device)
+            cos, sin = pipeline.model.model.rotary_emb(dummy_x, pos_ids)
+            cos_u = cos.unsqueeze(1) # shape: (1, 1, seq_len, head_dim)
+            sin_u = sin.unsqueeze(1) # shape: (1, 1, seq_len, head_dim)
+        else:
+            cos_u, sin_u = None, None
+
         # Apply changes layer by layer
         for layer_idx in range(num_layers):
             k_state, v_state = _get_layer_k_v(cache, layer_idx)
             
-            k_hot = k_state[:, :, cold_len:, :]
+            # Unrotate keys if model uses RoPE
+            if cos_u is not None:
+                k1 = k_state[..., : k_state.shape[-1] // 2]
+                k2 = k_state[..., k_state.shape[-1] // 2 :]
+                rot_k = torch.cat((-k2, k1), dim=-1)
+                k_state_unrot = (k_state * cos_u) - (rot_k * sin_u)
+            else:
+                k_state_unrot = k_state
+                
+            k_hot = k_state_unrot[:, :, cold_len:, :]
             v_hot = v_state[:, :, cold_len:, :]
             
-            k_cold_kept = k_state[:, :, keep_indices, :] if keep_indices else torch.empty(k_state.shape[0], k_state.shape[1], 0, k_state.shape[3], device=device, dtype=k_state.dtype)
+            k_cold_kept = k_state_unrot[:, :, keep_indices, :] if keep_indices else torch.empty(k_state.shape[0], k_state.shape[1], 0, k_state.shape[3], device=device, dtype=k_state.dtype)
             v_cold_kept = v_state[:, :, keep_indices, :] if keep_indices else torch.empty(v_state.shape[0], v_state.shape[1], 0, v_state.shape[3], device=device, dtype=v_state.dtype)
             
             k_clustered_list = []
             v_clustered_list = []
             for group in cluster_groups:
-                k_group_avg = k_state[:, :, group, :].mean(dim=2, keepdim=True)
+                k_group_avg = k_state_unrot[:, :, group, :].mean(dim=2, keepdim=True)
                 v_group_avg = v_state[:, :, group, :].mean(dim=2, keepdim=True)
                 
                 k_scale = k_group_avg.abs().max() + 1e-6
@@ -210,15 +233,34 @@ class KVCompressor:
             new_k = torch.cat([k_cold_kept, k_cold_clustered, k_hot], dim=2)
             new_v = torch.cat([v_cold_kept, v_cold_clustered, v_hot], dim=2)
             
+            # Re-rotate new_k to match new positions in the compressed cache
+            if has_rotary:
+                new_seq_len = new_k.shape[2]
+                new_pos_ids = torch.arange(new_seq_len, dtype=torch.long, device=device).unsqueeze(0)
+                new_dummy_x = torch.zeros(1, 1, new_seq_len, pipeline.model.config.hidden_size // pipeline.model.config.num_attention_heads).to(device)
+                new_cos, new_sin = pipeline.model.model.rotary_emb(new_dummy_x, new_pos_ids)
+                new_cos_u = new_cos.unsqueeze(1)
+                new_sin_u = new_sin.unsqueeze(1)
+                
+                nk1 = new_k[..., : new_k.shape[-1] // 2]
+                nk2 = new_k[..., new_k.shape[-1] // 2 :]
+                rot_nk = torch.cat((-nk2, nk1), dim=-1)
+                new_k = (new_k * new_cos_u) + (rot_nk * new_sin_u)
+                
             _set_layer_k_v(cache, layer_idx, new_k, new_v)
             
-        # 5. Fidelity Gate (KL Divergence check)
-        kl_div = self._check_fidelity(pipeline, original_cache, cache)
-        logger.info(f"[Compressor] Compression evaluated. Sequence length: {seq_len} -> {cache.get_seq_length()}. KL Divergence: {kl_div:.4f}")
+        # 5. Fidelity Gate — dispatch to cosine (fast) or KL (accurate) based on mode
+        if self.fidelity_mode == "cosine":
+            fidelity_score = self._check_fidelity_cosine(original_cache, cache)
+            score_label = "Cosine Divergence"
+        else:
+            fidelity_score = self._check_fidelity(pipeline, original_cache, cache)
+            score_label = "KL Divergence"
+        logger.info(f"[Compressor] Compression evaluated. Sequence length: {seq_len} -> {cache.get_seq_length()}. {score_label}: {fidelity_score:.4f}")
         
-        if kl_div > self.kl_threshold:
+        if fidelity_score > self.kl_threshold:
             # Revert to original cache
-            logger.warning(f"[Compressor] KL Divergence ({kl_div:.4f}) exceeds threshold ({self.kl_threshold}). Reverting cache...")
+            logger.warning(f"[Compressor] {score_label} ({fidelity_score:.4f}) exceeds threshold ({self.kl_threshold}). Reverting cache...")
             for idx in range(num_layers):
                 k_orig, v_orig = _get_layer_k_v(original_cache, idx)
                 _set_layer_k_v(cache, idx, k_orig, v_orig)
@@ -228,9 +270,9 @@ class KVCompressor:
                 log_pipeline_event("compress", {
                     "pre_len": seq_len,
                     "post_len": seq_len,
-                    "kl_div": kl_div,
+                    "kl_div": fidelity_score,
                     "accepted": False,
-                    "message": f"Cache compression REJECTED: KL divergence ({kl_div:.4f}) exceeded threshold ({self.kl_threshold})"
+                    "message": f"Cache compression REJECTED: {score_label} ({fidelity_score:.4f}) exceeded threshold ({self.kl_threshold})"
                 })
             except Exception:
                 pass
@@ -244,9 +286,9 @@ class KVCompressor:
                 "pre_len": seq_len,
                 "post_len": cache.get_seq_length(),
                 "savings": seq_len - cache.get_seq_length(),
-                "kl_div": kl_div,
+                "kl_div": fidelity_score,
                 "accepted": True,
-                "message": f"Cache compressed: {seq_len} -> {cache.get_seq_length()} slots. KL divergence: {kl_div:.4f} (Accepted)"
+                "message": f"Cache compressed: {seq_len} -> {cache.get_seq_length()} slots. {score_label}: {fidelity_score:.4f} (Accepted)"
             })
         except Exception:
             pass
@@ -298,4 +340,43 @@ class KVCompressor:
             return float(kl)
         except Exception as e:
             logger.error(f"[Compressor] Error in fidelity check: {e}")
+            return 999.0
+
+    def _check_fidelity_cosine(self, original_cache: DynamicCache, compressed_cache: DynamicCache) -> float:
+        """
+        Fast fidelity proxy using cosine similarity on KV cache tensors directly.
+        No LLM forward pass required — compares mean key vectors across shared positions.
+        
+        Returns:
+            Float in [0, 1]: 0 = identical, 1 = orthogonal.
+        """
+        try:
+            num_layers = min(_get_num_layers(original_cache), _get_num_layers(compressed_cache))
+            if num_layers == 0:
+                return 0.0
+            
+            cos_sims = []
+            for layer_idx in range(num_layers):
+                k_orig, _ = _get_layer_k_v(original_cache, layer_idx)
+                k_comp, _ = _get_layer_k_v(compressed_cache, layer_idx)
+                
+                # Compare mean key vectors across the shared sequence positions
+                min_len = min(k_orig.shape[2], k_comp.shape[2])
+                if min_len == 0:
+                    continue
+                
+                # Compare key states by flattening them to 1D vectors
+                orig_flat = k_orig[:, :, :min_len, :].reshape(-1).float()
+                comp_flat = k_comp[:, :, :min_len, :].reshape(-1).float()
+                
+                sim = F.cosine_similarity(orig_flat, comp_flat, dim=0).item()
+                cos_sims.append(sim)
+            
+            if not cos_sims:
+                return 0.0
+            
+            import numpy as np
+            return 1.0 - float(np.mean(cos_sims))  # 0 = identical, 1 = orthogonal
+        except Exception as e:
+            logger.error(f"[Compressor] Error in cosine fidelity check: {e}")
             return 999.0

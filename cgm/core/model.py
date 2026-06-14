@@ -28,11 +28,29 @@ class MemoryEncoderNetwork(nn.Module):
         # Define key (K) and value (V) projection layers for each LLM layer
         # Maps shape (batch, M, input_dim) -> (batch, M, num_heads * head_dim)
         self.k_projections = nn.ModuleList([
-            nn.Linear(input_dim, self.output_dim) for _ in range(num_layers)
+            nn.Sequential(
+                nn.Linear(input_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, self.output_dim)
+            ) for _ in range(num_layers)
         ])
         
         self.v_projections = nn.ModuleList([
-            nn.Linear(input_dim, self.output_dim) for _ in range(num_layers)
+            nn.Sequential(
+                nn.Linear(input_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, self.output_dim)
+            ) for _ in range(num_layers)
+        ])
+
+        # Per-layer LayerNorm for magnitude matching against the LLM's internal KV distribution.
+        # Without this, raw linear projections produce activations on an arbitrary scale that
+        # the frozen attention heads were never trained to attend over.
+        self.k_norms = nn.ModuleList([
+            nn.LayerNorm(self.output_dim) for _ in range(num_layers)
+        ])
+        self.v_norms = nn.ModuleList([
+            nn.LayerNorm(self.output_dim) for _ in range(num_layers)
         ])
 
         if self.use_routing:
@@ -70,6 +88,7 @@ class MemoryEncoderNetwork(nn.Module):
             # Project key states
             # (batch_size, M, input_dim) -> (batch_size, M, num_heads * head_dim)
             k_proj = self.k_projections[layer_idx](x)
+            k_proj = self.k_norms[layer_idx](k_proj)  # Magnitude matching
             
             # Reshape to (batch_size, M, num_heads, head_dim)
             k_states = k_proj.view(batch_size, M, self.num_heads, self.head_dim)
@@ -77,6 +96,7 @@ class MemoryEncoderNetwork(nn.Module):
             # Project value states
             # (batch_size, M, input_dim) -> (batch_size, M, num_heads * head_dim)
             v_proj = self.v_projections[layer_idx](x)
+            v_proj = self.v_norms[layer_idx](v_proj)  # Magnitude matching
             
             # Reshape to (batch_size, M, num_heads, head_dim)
             v_states = v_proj.view(batch_size, M, self.num_heads, self.head_dim)

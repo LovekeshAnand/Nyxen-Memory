@@ -1,9 +1,10 @@
 import torch
+import hashlib
 import numpy as np
 import logging
 import requests
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 from cgm.database.schema import SQLiteGraphStore
@@ -46,6 +47,8 @@ class CGMPipeline:
         self._store = None
         self._retriever = None
         self.active_cache = None
+        # MEN output cache: maps md5(input_tensor_bytes) -> List[(K, V)] for memoization
+        self._men_cache: Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
 
     def initialize(self, verbose: bool = True):
         """
@@ -195,7 +198,7 @@ class CGMPipeline:
             mode = "text"
             
         if mode == "inject" and memories:
-            print(f"[Pipeline] Extracted {len(memories)} relevant turns. Encoding memory...")
+            print(f"[Pipeline] Extracted {len(memories)} relevant turns. Encoding memory triples...")
             try:
                 from cgm.visualization.visualize import log_pipeline_event
                 log_pipeline_event("info", {
@@ -204,37 +207,89 @@ class CGMPipeline:
             except Exception:
                 pass
             
+            from cgm.training.train_data import encode_triple
+            
+            # Fetch triples from the graph store for each retrieved turn and encode properly
             x_list = []
-            for mem in memories:
-                # Compute embedding on the fly if not present
-                if mem.embedding is None:
-                    turn_text = f"{mem.user_text} {mem.assistant_text}"
-                    mem.embedding = self.retriever.embed_text(turn_text)
-                # Concatenate the embedding with itself to form a 768-dim vector
-                x_i = np.concatenate([mem.embedding, mem.embedding])
-                x_list.append(x_i)
+            with self.store._lock:
+                conn = self.store._get_connection()
+                cursor = conn.cursor()
+                for mem in memories:
+                    cursor.execute("""
+                        SELECT subject, predicate, object FROM triples
+                        WHERE conversation_id = ? AND turn_id = ?
+                    """, (conversation_id, mem.turn_id))
+                    triple_rows = cursor.fetchall()
+                    
+                    if triple_rows:
+                        # Encode each triple with proper [enc(subj||pred); enc(obj)] structure
+                        for row in triple_rows:
+                            triple = [row["subject"], row["predicate"], row["object"]]
+                            x_i = encode_triple(triple, self.retriever.embed_text)
+                            x_list.append(x_i)
+                    else:
+                        # Fallback: if no triples found, use turn text as both halves
+                        if mem.embedding is None:
+                            turn_text = f"{mem.user_text} {mem.assistant_text}"
+                            mem.embedding = self.retriever.embed_text(turn_text)
+                        x_i = np.concatenate([mem.embedding, mem.embedding])
+                        x_list.append(x_i)
+                conn.close()
+            
+            if not x_list:
+                print("[Pipeline] Warning: No triples found for retrieved memories. Skipping KV injection.")
+            else:
+                x_arr = np.stack(x_list) # shape: (M_triples, 768)
+                x_tensor = torch.tensor(x_arr, dtype=torch.float32).unsqueeze(0).to(self.device)
                 
-            x_arr = np.stack(x_list) # shape: (M, 768)
-            x_tensor = torch.tensor(x_arr, dtype=torch.float32).unsqueeze(0).to(self.device)
-            
-            # Validate input bounds
-            InputBufferGuard.validate_tensor_bounds(x_tensor.shape[1])
-            memory_length = x_tensor.shape[1]  # Number of memory positions
-            
-            # Pass through MEN to generate past_key_values
-            with torch.no_grad():
-                with GPULockManager():
-                    raw_kv_tuples = self.men(x_tensor)
-                    past_key_values = DynamicCache()
-                    for idx, (k_val, v_val) in enumerate(raw_kv_tuples):
-                        # Cast to match the target model's dtype (e.g. bfloat16/float16) to prevent RuntimeError
-                        k_cast = k_val.to(dtype=self.model.dtype)
-                        v_cast = v_val.to(dtype=self.model.dtype)
-                        past_key_values.update(k_cast, v_cast, idx)
-            
-            # Store in pipeline so the background compressor can monitor it
-            self.active_cache = past_key_values
-            print(f"[Pipeline] Memory KV cache injected: {memory_length} positions across {len(raw_kv_tuples)} layers.")
+                # Validate input bounds
+                InputBufferGuard.validate_tensor_bounds(x_tensor.shape[1])
+                memory_length = x_tensor.shape[1]  # Number of memory positions (= total triples)
+                
+                # Pass through MEN to generate past_key_values (with memoization)
+                cache_key = hashlib.md5(x_tensor.cpu().numpy().tobytes()).hexdigest()
+                
+                with torch.no_grad():
+                    with GPULockManager():
+                        if cache_key in self._men_cache:
+                            raw_kv_tuples = self._men_cache[cache_key]
+                        else:
+                            raw_kv_tuples = self.men(x_tensor)
+                            self._men_cache[cache_key] = raw_kv_tuples
+                        
+                        past_key_values = DynamicCache()
+                        
+                        # Dynamically find the target attention dtype
+                        if hasattr(self.model, "model") and hasattr(self.model.model, "layers") and len(self.model.model.layers) > 0:
+                            attn_dtype = self.model.model.layers[0].self_attn.q_proj.weight.dtype
+                        else:
+                            attn_dtype = next(self.model.parameters()).dtype
+                        
+                        # Apply RoPE to key states if model has rotary embeddings
+                        if hasattr(self.model.model, "rotary_emb"):
+                            pos_ids = torch.arange(memory_length, dtype=torch.long, device=self.device).unsqueeze(0)
+                            dummy_x = torch.zeros(1, 1, memory_length, self.model.config.hidden_size // self.model.config.num_attention_heads).to(self.device)
+                            cos, sin = self.model.model.rotary_emb(dummy_x, pos_ids)
+                            cos_u = cos.unsqueeze(1).to(dtype=attn_dtype) # (1, 1, memory_length, head_dim)
+                            sin_u = sin.unsqueeze(1).to(dtype=attn_dtype) # (1, 1, memory_length, head_dim)
+                        else:
+                            cos_u, sin_u = None, None
+                            
+                        for idx, (k_val, v_val) in enumerate(raw_kv_tuples):
+                            k_cast = k_val.to(dtype=attn_dtype)
+                            v_cast = v_val.to(dtype=attn_dtype)
+                            
+                            if cos_u is not None:
+                                k1 = k_cast[..., : k_cast.shape[-1] // 2]
+                                k2 = k_cast[..., k_cast.shape[-1] // 2 :]
+                                rot_k = torch.cat((-k2, k1), dim=-1)
+                                k_cast = (k_cast * cos_u) + (rot_k * sin_u)
+                                
+                            past_key_values.update(k_cast, v_cast, idx)
+                
+                # Store in pipeline so the background compressor can monitor it
+                self.active_cache = past_key_values
+                print(f"[Pipeline] Memory KV cache injected: {memory_length} triple positions across {len(raw_kv_tuples)} layers.")
 
         # 5. Build prompt
         if mode == "text" and memories:

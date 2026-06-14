@@ -1,60 +1,186 @@
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple, Optional
 from transformers.cache_utils import DynamicCache
 from cgm.database.schema import SQLiteGraphStore
 from cgm.retrieval.retriever import SubgraphRetriever
 from cgm.core.model import MemoryEncoderNetwork
 from cgm.core.pipeline import CGMPipeline
 from cgm.safety.safety import GPULockManager, GPUMemoryGuard, ThermalGuard
+from cgm.training.train_data import (
+    TripleTrainingSample, encode_triple, build_training_samples, split_train_eval
+)
+
 
 class MEGATrainer:
     """
     Trains the Memory Encoder Network (MEN) adapters to map
     retrieved graph triples to the attention space of the target LLM.
     Keeps the target LLM frozen.
+    
+    Supports two loss modes:
+    - 'generation': Cross-entropy next-token prediction only (original).
+    - 'distillation': Generation loss + auxiliary MSE loss anchoring MEN KV outputs
+                      to the frozen LLM's own KV states (KV-distillation).
     """
-    def __init__(self, pipeline: CGMPipeline, lr: float = 1e-4):
+    def __init__(self, pipeline: CGMPipeline, lr: float = 1e-4, distill_lambda: float = 0.5):
         self.pipeline = pipeline
         self.lr = lr
+        self.distill_lambda = distill_lambda
         self.thermal_guard = ThermalGuard(target_temp_c=75.0, max_temp_c=85.0)
         self.mem_guard = GPUMemoryGuard()
 
+    def _build_men_cache(self, x_triples: torch.Tensor) -> Tuple[DynamicCache, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Runs MEN forward and wraps output into a DynamicCache with position-appropriate RoPE rotation."""
+        raw_kv_tuples = self.pipeline.men(x_triples)
+        past_key_values = DynamicCache()
+        
+        # Dynamically find the target attention dtype
+        if hasattr(self.pipeline.model, "model") and hasattr(self.pipeline.model.model, "layers") and len(self.pipeline.model.model.layers) > 0:
+            attn_dtype = self.pipeline.model.model.layers[0].self_attn.q_proj.weight.dtype
+        else:
+            attn_dtype = next(self.pipeline.model.parameters()).dtype
+        
+        # Apply RoPE to key states if model has rotary embeddings
+        memory_length = x_triples.shape[1]
+        if hasattr(self.pipeline.model.model, "rotary_emb"):
+            pos_ids = torch.arange(memory_length, dtype=torch.long, device=self.pipeline.device).unsqueeze(0)
+            dummy_x = torch.zeros(1, 1, memory_length, self.pipeline.model.config.hidden_size // self.pipeline.model.config.num_attention_heads).to(self.pipeline.device)
+            cos, sin = self.pipeline.model.model.rotary_emb(dummy_x, pos_ids)
+            cos_u = cos.unsqueeze(1).to(dtype=attn_dtype) # (1, 1, memory_length, head_dim)
+            sin_u = sin.unsqueeze(1).to(dtype=attn_dtype) # (1, 1, memory_length, head_dim)
+        else:
+            cos_u, sin_u = None, None
+            
+        for idx, (k, v) in enumerate(raw_kv_tuples):
+            k_cast = k.to(dtype=attn_dtype)
+            v_cast = v.to(dtype=attn_dtype)
+            
+            if cos_u is not None:
+                k1 = k_cast[..., : k_cast.shape[-1] // 2]
+                k2 = k_cast[..., k_cast.shape[-1] // 2 :]
+                rot_k = torch.cat((-k2, k1), dim=-1)
+                k_cast = (k_cast * cos_u) + (rot_k * sin_u)
+                
+            past_key_values.update(k_cast, v_cast, idx)
+        return past_key_values, raw_kv_tuples
+
+    def _extract_teacher_kv(self, triple_text: str) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Runs the triple's natural language text through the frozen LLM to extract
+        the 'teacher' KV states — and unrotates them if the model uses RoPE.
+        """
+        teacher_ids = self.pipeline.tokenizer(triple_text, return_tensors="pt").input_ids.to(self.pipeline.device)
+        with torch.no_grad():
+            teacher_out = self.pipeline.model(teacher_ids, use_cache=True)
+        teacher_kv = teacher_out.past_key_values
+        
+        # Extract as list of (K, V) tuples
+        result = []
+        if isinstance(teacher_kv, DynamicCache):
+            if hasattr(teacher_kv, "key_cache") and teacher_kv.key_cache is not None:
+                for idx in range(len(teacher_kv.key_cache)):
+                    result.append((teacher_kv.key_cache[idx], teacher_kv.value_cache[idx]))
+            else:
+                for idx in range(len(teacher_kv.layers)):
+                    result.append((teacher_kv.layers[idx].keys, teacher_kv.layers[idx].values))
+        else:
+            # Tuple of tuples format
+            for kv_pair in teacher_kv:
+                result.append((kv_pair[0], kv_pair[1]))
+                
+        # Unrotate keys if model uses RoPE
+        if hasattr(self.pipeline.model.model, "rotary_emb"):
+            T = teacher_ids.shape[1]
+            pos_ids = torch.arange(T, dtype=torch.long, device=self.pipeline.device).unsqueeze(0)
+            dummy_x = torch.zeros(1, 1, T, self.pipeline.model.config.hidden_size // self.pipeline.model.config.num_attention_heads).to(self.pipeline.device)
+            cos, sin = self.pipeline.model.model.rotary_emb(dummy_x, pos_ids)
+            cos_u = cos.unsqueeze(1)
+            sin_u = sin.unsqueeze(1)
+            
+            unrotated_result = []
+            for idx, (k, v) in enumerate(result):
+                k1 = k[..., : k.shape[-1] // 2]
+                k2 = k[..., k.shape[-1] // 2 :]
+                rot_k = torch.cat((-k2, k1), dim=-1)
+                k_unrot = (k * cos_u) - (rot_k * sin_u)
+                unrotated_result.append((k_unrot, v))
+            return unrotated_result
+            
+        return result
+
+
+    def _compute_distillation_loss(
+        self, 
+        men_kv: List[Tuple[torch.Tensor, torch.Tensor]], 
+        teacher_kv: List[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> torch.Tensor:
+        """
+        MSE loss between MEN-projected KV states and the teacher LLM's own KV states.
+        We compare the last token of the sequence (T-1) to map the summary representation.
+        
+        Uses variance normalization to scale losses equally across all layers and K/V.
+        """
+        mse_losses = []
+        num_layers = min(len(men_kv), len(teacher_kv))
+        
+        for layer_idx in range(num_layers):
+            men_k, men_v = men_kv[layer_idx]
+            teach_k, teach_v = teacher_kv[layer_idx]
+            
+            # Cast to float32 for stable loss computation
+            men_k_f = men_k.float()
+            men_v_f = men_v.float()
+            teach_k_f = teach_k.float()
+            teach_v_f = teach_v.float()
+            
+            # Use the last token of the sequence: (batch, heads, seq, dim) -> (batch, heads, dim)
+            men_k_last = men_k_f[:, :, -1, :]
+            men_v_last = men_v_f[:, :, -1, :]
+            teach_k_last = teach_k_f[:, :, -1, :]
+            teach_v_last = teach_v_f[:, :, -1, :]
+            
+            # Compute variances of the teacher states to normalize scale differences across layers
+            var_k = teach_k_f.var().clamp(min=1e-6)
+            var_v = teach_v_f.var().clamp(min=1e-6)
+            
+            mse_k = F.mse_loss(men_k_last, teach_k_last) / var_k
+            mse_v = F.mse_loss(men_v_last, teach_v_last) / var_v
+            
+            mse_losses.append(mse_k + mse_v)
+        
+        return torch.stack(mse_losses).mean()
+
     def train_step(self, x_triples: torch.Tensor, prompt_ids: torch.Tensor, 
-                   target_ids: torch.Tensor, optimizer: optim.Optimizer) -> float:
+                   target_ids: torch.Tensor, optimizer: optim.Optimizer,
+                   triple_text: str = None, triple_idx: Optional[int] = None) -> Dict[str, float]:
         """
         Runs a single backpropagation training step on the MEN adapters.
-        Ensures thread locks and memory limits are respected.
+        
+        If triple_text is provided and distill_lambda > 0, computes the combined
+        generation + distillation loss.
         """
         # Enforce memory safety
         self.mem_guard.enforce_safety()
 
         with GPULockManager():
-            # Zero gradients
             optimizer.zero_grad()
 
-            raw_kv_tuples = self.pipeline.men(x_triples)
-            # Convert raw tuples to DynamicCache
-            past_key_values = DynamicCache()
-            for idx, (k, v) in enumerate(raw_kv_tuples):
-                # Cast to match the target model's dtype (e.g. bfloat16/float16) to prevent RuntimeError
-                k_cast = k.to(dtype=self.pipeline.model.dtype)
-                v_cast = v.to(dtype=self.pipeline.model.dtype)
-                past_key_values.update(k_cast, v_cast, idx)
+            # 1. MEN forward pass
+            past_key_values, raw_kv_tuples = self._build_men_cache(x_triples)
 
             # 2. Prepare inputs for LLM forward pass
             inputs = torch.cat([prompt_ids, target_ids], dim=-1).to(self.pipeline.device)
             
-            # Build attention mask that covers both injected memory positions and input tokens
             memory_length = x_triples.shape[1]
             memory_mask = torch.ones(inputs.shape[0], memory_length, dtype=torch.long, device=self.pipeline.device)
             inputs_mask = torch.ones_like(inputs)
             attention_mask = torch.cat([memory_mask, inputs_mask], dim=-1)
             
-            # Start absolute positions after the memory keys/values to avoid position overlap
             position_ids = torch.arange(
                 memory_length, 
                 memory_length + inputs.shape[-1], 
@@ -62,7 +188,7 @@ class MEGATrainer:
                 device=self.pipeline.device
             ).unsqueeze(0).expand(inputs.shape[0], -1)
             
-            # Forward pass through frozen LLM
+            # 3. Forward pass through frozen LLM
             outputs = self.pipeline.model(
                 inputs, 
                 past_key_values=past_key_values, 
@@ -70,25 +196,341 @@ class MEGATrainer:
                 position_ids=position_ids
             )
             
-            # 3. Compute loss
+            # 4. Compute generation loss (cross-entropy)
             logits = outputs.logits
-            
-            # Align logits and targets for loss calculation
             prompt_len = prompt_ids.shape[-1]
             target_len = target_ids.shape[-1]
             
-            # We slice logits corresponding to the target tokens
             shift_logits = logits[..., prompt_len - 1 : prompt_len + target_len - 1, :].contiguous()
             shift_labels = target_ids.contiguous()
             
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss_gen = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1)
+            )
+            
+            # 5. Compute distillation loss if enabled
+            loss_distill = torch.tensor(0.0, device=self.pipeline.device)
+            if triple_text is not None and self.distill_lambda > 0:
+                teacher_kv = self._extract_teacher_kv(triple_text)
+                if triple_idx is not None:
+                    # Slice raw_kv_tuples to get only the active triple's KVs
+                    sliced_men_kv = []
+                    for k, v in raw_kv_tuples:
+                        sliced_men_kv.append((k[:, :, triple_idx:triple_idx+1, :], v[:, :, triple_idx:triple_idx+1, :]))
+                    loss_distill = self._compute_distillation_loss(sliced_men_kv, teacher_kv)
+                else:
+                    loss_distill = self._compute_distillation_loss(raw_kv_tuples, teacher_kv)
+            
+            # 6. Combined loss
+            loss_total = loss_gen + self.distill_lambda * loss_distill
 
-            # 4. Backpropagation
-            loss.backward()
+            # 7. Backpropagation
+            loss_total.backward()
+            # Gradient clipping to prevent exploding gradients from distillation
+            torch.nn.utils.clip_grad_norm_(self.pipeline.men.parameters(), max_norm=1.0)
             optimizer.step()
 
-        return loss.item()
+        return {
+            "loss_total": loss_total.item(),
+            "loss_gen": loss_gen.item(),
+            "loss_distill": loss_distill.item(),
+        }
+
+    def evaluate_recall(self, eval_samples: List[TripleTrainingSample], x_all_tensor: torch.Tensor, max_new_tokens: int = 30) -> Dict[str, Any]:
+        """
+        Runs the eval split through the full pipeline and measures factual recall.
+        Does NOT train — pure inference evaluation.
+        
+        Returns:
+            Dict with 'recall_rate', 'total', 'recalled', 'details'.
+        """
+        self.pipeline.men.eval()
+        recalled = 0
+        details = []
+        
+        for sample in eval_samples:
+            # Extract the expected keyword from the target
+            obj = sample.triple[2].lower()
+            
+            # Run MEN + generation using the full x_all_tensor
+            with torch.no_grad():
+                raw_kv = self.pipeline.men(x_all_tensor)
+                past_kv = DynamicCache()
+                
+                # Dynamically find the target attention dtype
+                if hasattr(self.pipeline.model, "model") and hasattr(self.pipeline.model.model, "layers") and len(self.pipeline.model.model.layers) > 0:
+                    attn_dtype = self.pipeline.model.model.layers[0].self_attn.q_proj.weight.dtype
+                else:
+                    attn_dtype = next(self.pipeline.model.parameters()).dtype
+                
+                memory_length = x_all_tensor.shape[1]
+                # Apply RoPE to key states if model has rotary embeddings
+                if hasattr(self.pipeline.model.model, "rotary_emb"):
+                    pos_ids = torch.arange(memory_length, dtype=torch.long, device=self.pipeline.device).unsqueeze(0)
+                    dummy_x = torch.zeros(1, 1, memory_length, self.pipeline.model.config.hidden_size // self.pipeline.model.config.num_attention_heads).to(self.pipeline.device)
+                    cos, sin = self.pipeline.model.model.rotary_emb(dummy_x, pos_ids)
+                    cos_u = cos.unsqueeze(1).to(dtype=attn_dtype) # (1, 1, memory_length, head_dim)
+                    sin_u = sin.unsqueeze(1).to(dtype=attn_dtype) # (1, 1, memory_length, head_dim)
+                else:
+                    cos_u, sin_u = None, None
+                    
+                for idx, (k, v) in enumerate(raw_kv):
+                    k_cast = k.to(dtype=attn_dtype)
+                    v_cast = v.to(dtype=attn_dtype)
+                    
+                    if cos_u is not None:
+                        k1 = k_cast[..., : k_cast.shape[-1] // 2]
+                        k2 = k_cast[..., k_cast.shape[-1] // 2 :]
+                        rot_k = torch.cat((-k2, k1), dim=-1)
+                        k_cast = (k_cast * cos_u) + (rot_k * sin_u)
+                        
+                    past_kv.update(k_cast, v_cast, idx)
+                
+                prompt_ids = self.pipeline.tokenizer(sample.prompt_text, return_tensors="pt").input_ids.to(self.pipeline.device)
+                
+                memory_length = x_all_tensor.shape[1]
+                memory_mask = torch.ones(1, memory_length, dtype=torch.long, device=self.pipeline.device)
+                prompt_mask = torch.ones_like(prompt_ids)
+                full_mask = torch.cat([memory_mask, prompt_mask], dim=-1)
+                
+                position_ids = torch.arange(
+                    memory_length, memory_length + prompt_ids.shape[1],
+                    dtype=torch.long, device=self.pipeline.device
+                ).unsqueeze(0)
+                
+                outputs = self.pipeline.model.generate(
+                    prompt_ids,
+                    past_key_values=past_kv,
+                    attention_mask=full_mask,
+                    position_ids=position_ids,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=self.pipeline.tokenizer.pad_token_id,
+                    do_sample=False,  # Greedy for deterministic eval
+                )
+            
+            response = self.pipeline.tokenizer.decode(outputs[0][prompt_ids.shape[1]:], skip_special_tokens=True).strip()
+            hit = obj in response.lower()
+            if hit:
+                recalled += 1
+            details.append({
+                "triple": sample.triple,
+                "expected": obj,
+                "response": response,
+                "recalled": hit,
+            })
+        
+        self.pipeline.men.train()
+        
+        total = len(eval_samples)
+        return {
+            "recall_rate": (recalled / total * 100) if total > 0 else 0.0,
+            "total": total,
+            "recalled": recalled,
+            "details": details,
+        }
+
+    def fit(
+        self, 
+        train_samples: List[TripleTrainingSample],
+        eval_samples: List[TripleTrainingSample],
+        epochs: int = 200,
+        patience: int = 15,
+        lr: float = None,
+    ) -> Dict[str, Any]:
+        """
+        Full training loop with KV-distillation, multi-triple data, and eval-recall early stopping.
+        
+        Args:
+            train_samples: Training set of TripleTrainingSample.
+            eval_samples: Eval set of TripleTrainingSample (disjoint from train).
+            epochs: Maximum number of epochs.
+            patience: Early stop after this many epochs without eval recall improvement.
+            lr: Learning rate override.
+            
+        Returns:
+            Dict with training history.
+        """
+        if lr is None:
+            lr = self.lr
+            
+        print("\n=== STARTING MEN TRAINING WITH KV-DISTILLATION ===")
+        print(f"  Train samples : {len(train_samples)}")
+        print(f"  Eval samples  : {len(eval_samples)}")
+        print(f"  Max epochs    : {epochs}")
+        print(f"  Patience      : {patience}")
+        print(f"  Distill λ     : {self.distill_lambda}")
+        print(f"  Learning rate : {lr}")
+        
+        # Freeze LLM, unfreeze MEN
+        for param in self.pipeline.model.parameters():
+            param.requires_grad = False
+        for param in self.pipeline.men.parameters():
+            param.requires_grad = True
+        self.pipeline.men.train()
+        
+        optimizer = optim.AdamW(self.pipeline.men.parameters(), lr=lr, weight_decay=0.01)
+        
+        # Build the combined x_all_tensor containing all triples (train + eval)
+        # to match the inference sequence length distribution. Ensure only unique triples are used.
+        unique_triples = []
+        unique_x_vectors = []
+        seen_triples = set()
+        for sample in train_samples + eval_samples:
+            triple_key = f"{sample.triple[0]}|{sample.triple[1]}|{sample.triple[2]}"
+            if triple_key not in seen_triples:
+                seen_triples.add(triple_key)
+                unique_triples.append(sample.triple)
+                unique_x_vectors.append(sample.x_vector)
+                
+        x_all_arr = np.stack(unique_x_vectors)
+        x_all_tensor = torch.tensor(x_all_arr, dtype=torch.float32).unsqueeze(0).to(self.pipeline.device)
+        
+        # Pre-tokenize all samples
+        tokenized_samples = []
+        for sample in train_samples:
+            # Find the index of this sample in the unique triples list
+            triple_idx = -1
+            for idx, trip in enumerate(unique_triples):
+                if trip == sample.triple:
+                    triple_idx = idx
+                    break
+            
+            prompt_ids = self.pipeline.tokenizer(sample.prompt_text, return_tensors="pt").input_ids.to(self.pipeline.device)
+            target_ids = self.pipeline.tokenizer(sample.target_text, return_tensors="pt").input_ids.to(self.pipeline.device)
+            tokenized_samples.append((x_all_tensor, prompt_ids, target_ids, sample.triple_text, triple_idx))
+        
+        # Dynamic Magnitude Calibration
+        print("  Running dynamic magnitude calibration...")
+        with torch.no_grad():
+            # Extract teacher KVs for all unique training triples
+            all_teacher_kvs = []
+            seen_texts = set()
+            for sample in train_samples:
+                if sample.triple_text not in seen_texts:
+                    seen_texts.add(sample.triple_text)
+                    teacher_kv = self._extract_teacher_kv(sample.triple_text)
+                    all_teacher_kvs.append(teacher_kv)
+            
+            # For each layer, compute mean and std across all samples
+            num_layers = len(all_teacher_kvs[0])
+            for layer_idx in range(num_layers):
+                layer_ks = []
+                layer_vs = []
+                for tkvs in all_teacher_kvs:
+                    k, v = tkvs[layer_idx]
+                    layer_ks.append(k.cpu())
+                    layer_vs.append(v.cpu())
+                
+                # Concatenate along the sequence dimension (dim=2) to get global stats
+                all_k = torch.cat(layer_ks, dim=2)
+                all_v = torch.cat(layer_vs, dim=2)
+                
+                mean_k = all_k.mean().item()
+                std_k = all_k.std().item()
+                mean_v = all_v.mean().item()
+                std_v = all_v.std().item()
+                
+                # Initialize LayerNorm parameters in MEN to match teacher distribution
+                self.pipeline.men.k_norms[layer_idx].weight.data.fill_(std_k)
+                self.pipeline.men.k_norms[layer_idx].bias.data.fill_(mean_k)
+                self.pipeline.men.v_norms[layer_idx].weight.data.fill_(std_v)
+                self.pipeline.men.v_norms[layer_idx].bias.data.fill_(mean_v)
+                
+                if layer_idx in [0, num_layers // 2, num_layers - 1]:
+                    print(f"    Layer {layer_idx:2d} | Key std={std_k:.4f}, mean={mean_k:.4f} | Val std={std_v:.4f}, mean={mean_v:.4f}")
+        
+        trainable_params = sum(p.numel() for p in self.pipeline.men.parameters() if p.requires_grad)
+        print(f"  Trainable params: {trainable_params:,}")
+        print("  Starting optimization loop...\n")
+        
+        history = {"train_loss": [], "train_loss_gen": [], "train_loss_distill": [], "eval_recall": []}
+        best_recall = -1.0
+        best_loss = 999.0
+        best_epoch = 0
+        epochs_without_improvement = 0
+        best_state_dict = None
+        
+        for epoch in range(1, epochs + 1):
+            start_time = time.time()
+            
+            # Shuffle training order each epoch (rotate by epoch for determinism)
+            order = list(range(len(tokenized_samples)))
+            np.random.seed(epoch)
+            np.random.shuffle(order)
+            
+            epoch_losses = {"total": [], "gen": [], "distill": []}
+            
+            for sample_idx in order:
+                x_tensor, prompt_ids, target_ids, triple_text, triple_idx = tokenized_samples[sample_idx]
+                
+                losses = self.train_step(x_tensor, prompt_ids, target_ids, optimizer, triple_text=triple_text, triple_idx=triple_idx)
+                epoch_losses["total"].append(losses["loss_total"])
+                epoch_losses["gen"].append(losses["loss_gen"])
+                epoch_losses["distill"].append(losses["loss_distill"])
+            
+            avg_total = np.mean(epoch_losses["total"])
+            avg_gen = np.mean(epoch_losses["gen"])
+            avg_distill = np.mean(epoch_losses["distill"])
+            
+            history["train_loss"].append(avg_total)
+            history["train_loss_gen"].append(avg_gen)
+            history["train_loss_distill"].append(avg_distill)
+            
+            # Eval every 5 epochs or on first/last
+            run_eval = (epoch % 5 == 0 or epoch == 1 or epoch == epochs)
+            eval_recall_pct = -1.0
+            
+            if run_eval and eval_samples:
+                eval_result = self.evaluate_recall(eval_samples, x_all_tensor)
+                eval_recall_pct = eval_result["recall_rate"]
+                history["eval_recall"].append(eval_recall_pct)
+                
+                # Check if this epoch is better (higher recall, or same recall with lower loss)
+                is_better = False
+                if eval_recall_pct > best_recall:
+                    is_better = True
+                elif eval_recall_pct == best_recall and avg_total < best_loss:
+                    is_better = True
+                    
+                if is_better:
+                    best_recall = eval_recall_pct
+                    best_loss = avg_total
+                    best_epoch = epoch
+                    epochs_without_improvement = 0
+                    import copy
+                    best_state_dict = copy.deepcopy(self.pipeline.men.state_dict())
+                else:
+                    epochs_without_improvement += 5  # We eval every 5 epochs
+            
+            duration = time.time() - start_time
+            
+            # Print progress
+            if epoch % 10 == 0 or epoch == 1 or epoch <= 5 or run_eval:
+                eval_str = f" | Eval Recall: {eval_recall_pct:.1f}%" if eval_recall_pct >= 0 else ""
+                print(f"  Epoch {epoch:3d}/{epochs} | Loss: {avg_total:.4f} (gen={avg_gen:.4f}, dist={avg_distill:.4f}){eval_str} | {duration:.2f}s")
+            
+            # Thermal safety
+            self.thermal_guard.cycle()
+            
+            # Early stopping on eval recall
+            if epochs_without_improvement >= patience and best_recall >= 0:
+                print(f"\n  [Early Stop] No recall improvement for {patience} epochs. Best: {best_recall:.1f}% at epoch {best_epoch}.")
+                break
+            
+            # Perfect recall — stop early
+            if best_recall >= 100.0:
+                print(f"\n  [Perfect Recall] 100% eval recall at epoch {epoch}. Stopping.")
+                break
+        
+        # Restore the best weights
+        if best_state_dict is not None:
+            self.pipeline.men.load_state_dict(best_state_dict)
+            
+        self.pipeline.men.eval()
+        print(f"\n=== TRAINING COMPLETE === Best eval recall: {best_recall:.1f}% (epoch {best_epoch})")
+        
+        return history
 
     def fit_prototype(self, epochs: int = 10):
         """
@@ -150,11 +592,11 @@ class MEGATrainer:
         for epoch in range(1, epochs + 1):
             start_time = time.time()
             
-            # Execute step
-            loss = self.train_step(x_tensor, prompt_ids, target_ids, optimizer)
+            # Execute step (legacy mode — generation loss only, no distillation)
+            losses = self.train_step(x_tensor, prompt_ids, target_ids, optimizer, triple_text=None)
             
             duration = time.time() - start_time
-            print(f"  Epoch {epoch:2d}/{epochs:2d} | Loss: {loss:.6f} | Time: {duration:.3f}s")
+            print(f"  Epoch {epoch:2d}/{epochs:2d} | Loss: {losses['loss_total']:.6f} | Time: {duration:.3f}s")
             
             # Enforce thermal safety rules to avoid overheating GPU RTX A2000
             self.thermal_guard.cycle()

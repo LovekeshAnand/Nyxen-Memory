@@ -1,7 +1,7 @@
 import os
 import time
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Dict
 from dataclasses import dataclass
 from cgm.database.schema import SQLiteGraphStore, HybridMemoryObject
 from cgm.safety.safety import GPULockManager
@@ -32,6 +32,11 @@ class RAGRetriever:
         self.index_path = index_path
         self._embedder = None
         self.index = None
+        
+        # Embedding cache to avoid redundant SentenceTransformer forward passes
+        self._embedding_cache: Dict[str, np.ndarray] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
         
         # Load or initialize the index
         self._init_index()
@@ -75,10 +80,27 @@ class RAGRetriever:
     def embed_text(self, text: str) -> np.ndarray:
         """
         Computes dense vector representation of a given string.
+        Uses an in-memory cache to skip redundant forward passes.
         """
+        if text in self._embedding_cache:
+            self._cache_hits += 1
+            return self._embedding_cache[text]
+        self._cache_misses += 1
         with GPULockManager():
             embedding = self.embedder.encode(text, convert_to_numpy=True)
+        self._embedding_cache[text] = embedding
         return embedding
+
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Returns embedding cache hit/miss statistics."""
+        total = self._cache_hits + self._cache_misses
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "total": total,
+            "hit_rate": (self._cache_hits / total * 100) if total > 0 else 0.0,
+            "cache_size": len(self._embedding_cache),
+        }
 
     def embed_texts(self, texts: List[str]) -> np.ndarray:
         """
