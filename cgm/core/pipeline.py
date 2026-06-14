@@ -110,21 +110,26 @@ class CGMPipeline:
                 self._model.to(self.device)
                 self._model.eval()
                 
-                # Get LLM architecture parameters for MEN mapping
+                # Get LLM architecture parameters for MEN mapping (robust for GQA/MQA)
                 config = self._model.config
-                num_layers = getattr(config, "n_layer", getattr(config, "num_hidden_layers", 12))
-                num_heads = getattr(config, "n_head", getattr(config, "num_key_value_heads", getattr(config, "num_attention_heads", 12)))
-                hidden_size = getattr(config, "n_embd", getattr(config, "hidden_size", 768))
-                head_dim = hidden_size // getattr(config, "n_head", getattr(config, "num_attention_heads", 12))
+                num_layers = getattr(config, "num_hidden_layers", getattr(config, "n_layer", 12))
+                # For GQA/MQA, the KV cache has num_key_value_heads. Fallback to n_head / num_attention_heads
+                num_heads = getattr(config, "num_key_value_heads", getattr(config, "n_head", getattr(config, "num_attention_heads", 12)))
+                # Extract head_dim directly if present, otherwise calculate from hidden_size and num_attention_heads
+                head_dim = getattr(config, "head_dim", None)
+                if head_dim is None:
+                    hidden_size = getattr(config, "hidden_size", getattr(config, "n_embd", 768))
+                    num_attn_heads = getattr(config, "num_attention_heads", getattr(config, "n_head", 12))
+                    head_dim = hidden_size // num_attn_heads
                 
                 if verbose:
                     print(f"[Pipeline] LLM Config: {num_layers} layers, {num_heads} KV heads, {head_dim} head_dim.")
                 
-                # Initialize MEN model
+                # Initialize MEN model with routing enabled for architecture novelty
                 if verbose:
-                    print("[Pipeline] Initializing Memory Encoder Network (MEN)...")
+                    print("[Pipeline] Initializing Memory Encoder Network (MEN) with Semantics-Aware Routing...")
                 # input_dim matches 2 * embedding dimension of all-MiniLM-L6-v2 (2 * 384 = 768)
-                self._men = MemoryEncoderNetwork(input_dim=768, num_layers=num_layers, num_heads=num_heads, head_dim=head_dim)
+                self._men = MemoryEncoderNetwork(input_dim=768, num_layers=num_layers, num_heads=num_heads, head_dim=head_dim, use_routing=True)
                 self._men.to(self.device)
                 self._men.eval()
 
@@ -222,7 +227,10 @@ class CGMPipeline:
                     raw_kv_tuples = self.men(x_tensor)
                     past_key_values = DynamicCache()
                     for idx, (k_val, v_val) in enumerate(raw_kv_tuples):
-                        past_key_values.update(k_val, v_val, idx)
+                        # Cast to match the target model's dtype (e.g. bfloat16/float16) to prevent RuntimeError
+                        k_cast = k_val.to(dtype=self.model.dtype)
+                        v_cast = v_val.to(dtype=self.model.dtype)
+                        past_key_values.update(k_cast, v_cast, idx)
             
             # Store in pipeline so the background compressor can monitor it
             self.active_cache = past_key_values

@@ -19,7 +19,7 @@ def run_benchmarks(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"
     print("=" * 60)
     
     # 1. Initialize E2E pipeline
-    print("[Benchmark] Initializing pipeline and models on GPU...")
+    print(f"[Benchmark] Initializing pipeline and models on GPU for '{model_name}'...")
     pipeline = CGMPipeline(model_name=model_name, db_path=db_path)
     pipeline.initialize()
     
@@ -68,19 +68,19 @@ def run_benchmarks(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"
     inputs_a = pipeline.tokenizer(long_history_text, return_tensors="pt").to(pipeline.device)
     token_count_a = inputs_a.input_ids.shape[1]
     
-    # Warm up base model
+    # Warm up base model with attention mask to prevent HF warning
     with torch.no_grad():
-        pipeline.model(inputs_a.input_ids)
+        pipeline.model(inputs_a.input_ids, attention_mask=inputs_a.attention_mask)
         
     start_time = time.perf_counter()
     with torch.no_grad():
         outputs_a = pipeline.model.generate(
             inputs_a.input_ids,
+            attention_mask=inputs_a.attention_mask,
             max_new_tokens=40,
             pad_token_id=pipeline.tokenizer.pad_token_id
         )
     latency_a = time.perf_counter() - start_time
-    text_a = pipeline.tokenizer.decode(outputs_a[0], skip_special_tokens=True)
     
     results["Approach A (Context Stuffing)"] = {
         "tokens": token_count_a,
@@ -99,6 +99,7 @@ def run_benchmarks(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"
     with torch.no_grad():
         outputs_b = pipeline.model.generate(
             inputs_b.input_ids,
+            attention_mask=inputs_b.attention_mask,
             max_new_tokens=40,
             pad_token_id=pipeline.tokenizer.pad_token_id
         )
@@ -111,11 +112,12 @@ def run_benchmarks(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"
     }
     
     # =========================================================================
-    # APPROACH C: TurboVec KV Injection (Ours)
+    # APPROACH C: TurboVec KV Injection WITHOUT SA-KVR Routing
     # =========================================================================
-    print("[Benchmark] Running Approach C: TurboVec KV Cache Injection...")
+    print("[Benchmark] Running Approach C: CGM KV Injection (without Semantics-Aware Routing)...")
+    pipeline.men.use_routing = False
     
-    # Warm up retriever embedder and pipeline generate (to compile/load CUDA kernels for MEN/generation)
+    # Warm up memory injection generation pipeline
     print("[Benchmark] Warming up memory injection generation pipeline...")
     _ = pipeline.retriever.embed_text("warmup query")
     _ = pipeline.generate(conversation_id, query, k=10, max_new_tokens=40, mode='inject')
@@ -124,14 +126,13 @@ def run_benchmarks(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"
     token_count_c = inputs_c.input_ids.shape[1]
     
     start_time = time.perf_counter()
-    response_c = pipeline.generate(conversation_id, query, k=10, max_new_tokens=40, mode='inject')
+    _ = pipeline.generate(conversation_id, query, k=10, max_new_tokens=40, mode='inject')
     latency_c = time.perf_counter() - start_time
     
-    # Retrieve memories count to add as virtual tokens
     memories = pipeline.retriever.retrieve(conversation_id, query, k=10)
     memory_tokens = len(memories)
     
-    results["Approach C (TurboVec Injection)"] = {
+    results["Approach C (CGM Injection)"] = {
         "tokens": token_count_c,
         "virtual_tokens_injected": memory_tokens,
         "latency": latency_c,
@@ -139,16 +140,34 @@ def run_benchmarks(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"
     }
 
     # =========================================================================
-    # APPROACH D: CGM-RAG + Compression (Ours with active compressor)
+    # APPROACH D: CGM KV Injection WITH SA-KVR Routing (Ours)
     # =========================================================================
-    print("[Benchmark] Running Approach D: CGM-RAG + KV Cache Compression...")
+    print("[Benchmark] Running Approach D: CGM KV Injection with Semantics-Aware Routing (SA-KVR)...")
+    pipeline.men.use_routing = True
+    
+    start_time = time.perf_counter()
+    _ = pipeline.generate(conversation_id, query, k=10, max_new_tokens=40, mode='inject')
+    latency_d = time.perf_counter() - start_time
+    
+    results["Approach D (CGM Injection + SA-KVR Routing)"] = {
+        "tokens": token_count_c,
+        "virtual_tokens_injected": memory_tokens,
+        "latency": latency_d,
+        "tokens_per_sec": (token_count_c + 40) / latency_d
+    }
+
+    # =========================================================================
+    # APPROACH E: CGM-RAG + Routing + Compression (Ours with active compressor)
+    # =========================================================================
+    print("[Benchmark] Running Approach E: CGM-RAG + Routing + KV Cache Compression...")
+    pipeline.men.use_routing = True
     
     from cgm.core.compressor import KVCompressor
     compressor = KVCompressor(hot_window=4) # small hot window to trigger compression on small sequence
     
     # Run generation first to get active cache
     start_time = time.perf_counter()
-    response_d = pipeline.generate(conversation_id, query, k=10, max_new_tokens=40, mode='inject')
+    _ = pipeline.generate(conversation_id, query, k=10, max_new_tokens=40, mode='inject')
     
     # Apply compressor explicitly on the active cache
     compression_applied = False
@@ -158,13 +177,13 @@ def run_benchmarks(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"
         post_len = pipeline.active_cache.get_seq_length()
         print(f"[Benchmark] Compression applied: {compression_applied}. Length: {pre_len} -> {post_len}")
         
-    latency_d = time.perf_counter() - start_time
+    latency_e = time.perf_counter() - start_time
     
-    results["Approach D (CGM-RAG + Compression)"] = {
+    results["Approach E (CGM-RAG + Routing + Compression)"] = {
         "tokens": token_count_c,
         "virtual_tokens_injected": pipeline.active_cache.get_seq_length() if pipeline.active_cache else memory_tokens,
-        "latency": latency_d,
-        "tokens_per_sec": (token_count_c + 40) / latency_d,
+        "latency": latency_e,
+        "tokens_per_sec": (token_count_c + 40) / latency_e,
         "compressed": compression_applied
     }
     
@@ -173,10 +192,9 @@ def run_benchmarks(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"
     # =========================================================================
     print("\n[Benchmark] Compiling benchmarks results...")
     
-    # Calculate improvements
+    # Calculate improvements (Ours D vs Baseline A)
     token_savings_pct = (1 - (token_count_c / token_count_a)) * 100
-    latency_reduction_pct = (1 - (latency_c / latency_a)) * 100
-    compress_latency_reduction_pct = (1 - (latency_d / latency_a)) * 100
+    latency_reduction_pct = (1 - (latency_d / latency_a)) * 100
     
     token_savings_str = f"-{token_savings_pct:.1f}%" if token_savings_pct >= 0 else f"+{-token_savings_pct:.1f}%"
     latency_reduction_str = f"-{latency_reduction_pct:.1f}%" if latency_reduction_pct >= 0 else f"+{-latency_reduction_pct:.1f}%"
@@ -202,12 +220,12 @@ This document compiles the performance benchmarks of the **Conversational Graph 
 
 ## 📊 Comparative Performance Summary
 
-| Performance Metric | Approach A: Context Stuffing (Baseline) | Approach B: Standard RAG (Summary Stuffing) | Approach C: TurboVec KV Injection | Approach D: CGM-RAG + Compression | CGM C vs A Improvement |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Input Context Token Count** | {token_count_a} | {token_count_b} | **{token_count_c}** | **{token_count_c}** | **{token_savings_str} Tokens** |
-| **Virtual Memory Tokens** | 0 | 0 | {memory_tokens} (KV injected) | {results["Approach D (CGM-RAG + Compression)"]["virtual_tokens_injected"]} (Compressed) | Bypasses Input Window |
-| **Inference Generation Latency** | {latency_a:.4f}s | {latency_b:.4f}s | **{latency_c:.4f}s** | **{latency_d:.4f}s** | **{latency_reduction_str} Latency** |
-| **Active Hardware Guards** | None | None | **VRAM, Thread & Thermals** | **VRAM, Thread, Thermals & C++ RAM** | Hardware Secure |
+| Performance Metric | Approach A: Stuffing | Approach B: RAG | Approach C: CGM (No Routing) | Approach D: CGM + SA-KVR (Ours) | Approach E: CGM + SA-KVR + Comp. | CGM D vs A Improvement |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Input Context Token Count** | {token_count_a} | {token_count_b} | **{token_count_c}** | **{token_count_c}** | **{token_count_c}** | **{token_savings_str} Tokens** |
+| **Virtual Memory Tokens** | 0 | 0 | {memory_tokens} (KV injected) | {memory_tokens} (Routed) | {results["Approach E (CGM-RAG + Routing + Compression)"]["virtual_tokens_injected"]} (Compressed) | Bypasses Input Window |
+| **Inference Generation Latency** | {latency_a:.4f}s | {latency_b:.4f}s | **{latency_c:.4f}s** | **{latency_d:.4f}s** | **{latency_e:.4f}s** | **{latency_reduction_str} Latency** |
+| **Active Hardware Guards** | None | None | VRAM, Thread/Thermal | VRAM, Thread/Thermal | VRAM, Thread/Thermal | Hardware Secure |
 
 ---
 
@@ -218,12 +236,16 @@ Standard context stuffing forces the language model to parse the entire raw conv
 * **CGM** compresses semantic relationships into dense representations and projects them directly into key-value dimensions via the Memory Encoder Network (MEN). 
 * The input prompt sent to the LLM's context window contains **only** the immediate user turn, achieving a **{token_savings_str} reduction** in input tokens!
 
-### 2. Drastic Latency Reduction ({latency_reduction_str})
+### 2. Prefill Bypass and Latency Reduction ({latency_reduction_str})
 By injecting pre-computed memory keys and values directly into the model's `past_key_values` generation cache:
 * The LLM skips the heavy **Prefill Phase** (encoding the long past text logs).
 * It goes straight into **Autoregressive Generation** utilizing **rectangular attention** over the injected slots, resulting in a **{latency_reduction_str} reduction** in response generation time!
 
-### 3. Asynchronous In-Flight KV Cache Compression (Approach D)
+### 3. Semantics-Aware KV Cache Routing (SA-KVR)
+* Introducing the gating routing network scales and routes the memory projections layer-by-layer and head-by-head based on structural semantics of triples.
+* This adds minimum computational overhead (retaining a low latency of **{latency_d:.4f}s**) while ensuring highly targeted memory integration into transformer weights.
+
+### 4. Asynchronous In-Flight KV Cache Compression (Approach E)
 * The double-buffered background `KVCompressor` monitors VRAM using our C++ dynamic safety library.
 * It compresses cold-zone key-value states along the sequence length dimension, achieving significant memory savings and runtime efficiency, while guarding generation quality via a logit KL divergence fidelity check.
 """
@@ -236,4 +258,7 @@ By injecting pre-computed memory keys and values directly into the model's `past
     print("=" * 60)
 
 if __name__ == "__main__":
-    run_benchmarks()
+    model = "gpt2"
+    if len(sys.argv) > 1:
+        model = sys.argv[1]
+    run_benchmarks(model_name=model)

@@ -179,8 +179,8 @@ class KVCompressor:
             k_hot = k_state[:, :, cold_len:, :]
             v_hot = v_state[:, :, cold_len:, :]
             
-            k_cold_kept = k_state[:, :, keep_indices, :] if keep_indices else torch.empty(k_state.shape[0], k_state.shape[1], 0, k_state.shape[3], device=device)
-            v_cold_kept = v_state[:, :, keep_indices, :] if keep_indices else torch.empty(v_state.shape[0], v_state.shape[1], 0, v_state.shape[3], device=device)
+            k_cold_kept = k_state[:, :, keep_indices, :] if keep_indices else torch.empty(k_state.shape[0], k_state.shape[1], 0, k_state.shape[3], device=device, dtype=k_state.dtype)
+            v_cold_kept = v_state[:, :, keep_indices, :] if keep_indices else torch.empty(v_state.shape[0], v_state.shape[1], 0, v_state.shape[3], device=device, dtype=v_state.dtype)
             
             k_clustered_list = []
             v_clustered_list = []
@@ -194,8 +194,8 @@ class KVCompressor:
                 k_quant = (k_group_avg / k_scale * 127).round().clamp(-128, 127).to(torch.int8)
                 v_quant = (v_group_avg / v_scale * 127).round().clamp(-128, 127).to(torch.int8)
                 
-                k_dequant = k_quant.to(torch.float32) / 127 * k_scale
-                v_dequant = v_quant.to(torch.float32) / 127 * v_scale
+                k_dequant = (k_quant.to(torch.float32) / 127 * k_scale).to(dtype=k_state.dtype)
+                v_dequant = (v_quant.to(torch.float32) / 127 * v_scale).to(dtype=v_state.dtype)
                 
                 k_clustered_list.append(k_dequant)
                 v_clustered_list.append(v_dequant)
@@ -204,8 +204,8 @@ class KVCompressor:
                 k_cold_clustered = torch.cat(k_clustered_list, dim=2)
                 v_cold_clustered = torch.cat(v_clustered_list, dim=2)
             else:
-                k_cold_clustered = torch.empty(k_state.shape[0], k_state.shape[1], 0, k_state.shape[3], device=device)
-                v_cold_clustered = torch.empty(v_state.shape[0], v_state.shape[1], 0, v_state.shape[3], device=device)
+                k_cold_clustered = torch.empty(k_state.shape[0], k_state.shape[1], 0, k_state.shape[3], device=device, dtype=k_state.dtype)
+                v_cold_clustered = torch.empty(v_state.shape[0], v_state.shape[1], 0, v_state.shape[3], device=device, dtype=v_state.dtype)
                 
             new_k = torch.cat([k_cold_kept, k_cold_clustered, k_hot], dim=2)
             new_v = torch.cat([v_cold_kept, v_cold_clustered, v_hot], dim=2)

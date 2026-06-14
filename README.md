@@ -8,77 +8,50 @@ The codebase is optimized for local workstation environments (such as the NVIDIA
 
 ## System Architecture
 
-The following diagram illustrates the data flow, components, and hardware locks within the CGM-RAG pipeline. The system operates on three synchronized layers: user interaction, memory retrieval/projection, and hardware security.
+The Conversational Graph Memory (CGM) pipeline processes dialogue turns and queries through a clean, sequential four-phase architecture, backed by a real-time hardware safety guard runtime.
 
 ```mermaid
-graph TD
+flowchart TD
     %% Styling Definitions
     classDef default fill:#0f172a,stroke:#334155,stroke-width:1px,color:#f8fafc;
     classDef container fill:#1e293b,stroke:#06b6d4,stroke-width:2px,color:#f8fafc;
     classDef active fill:#1e1b4b,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
-    classDef hardware fill:#020617,stroke:#e11d48,stroke-width:2px,color:#f8fafc;
+    classDef hardware fill:#020617,stroke:#e11d48,stroke-width:1.5px,color:#f8fafc;
 
-    subgraph UserInterface["User Interface & Controls"]
-        Shell["Interactive CLI Shell<br/>(chat.py)"]
-        WebDash["Real-Time Dashboard HTTP Server<br/>(Port 8050 / vis.js & chart.js)"]
+    subgraph Phase1["1. Ingest & Store"]
+        A[User Dialogue Turn] -->|Closed-Loop Extraction| B[NLP Parser]
+        B -->|Extract Triples| C[(SQLite Graph Store)]
+        B -->|Dense Embedding| D[(TurboVec Quantized Index)]
     end
-    class UserInterface container;
+    class Phase1 container;
 
-    subgraph MemoryRetrieval["Memory Retrieval Subsystem"]
-        Embedder["SentenceTransformer Embedder<br/>(all-MiniLM-L6-v2 on CUDA)"]
-        Index["TurboVec Vector Index<br/>(4-bit quantized cgm_rag.tvim)"]
-        SQLStore["SQLite Graph Store<br/>(cgm_memory.db - Triples & Entities)"]
+    subgraph Phase2["2. Retrieve & Feature Extract"]
+        E[Active User Query] -->|Cosine Similarity Search| D
+        D -->|Top-k Semantically Relevant Turns| C
+        C -->|Triples Concatenation| F[Semantic Feature Extraction]
     end
-    class MemoryRetrieval container;
+    class Phase2 container;
 
-    subgraph AttentionProjection["Attention Space Projection (MEN)"]
-        MEN["Memory Encoder Network<br/>(Linear Projection Layers)"]
-        KVCache["Dynamic KV Cache<br/>(PyTorch DynamicCache)"]
-        Compressor["KV Cache Compressor<br/>(In-Flight KL-Divergence Compression)"]
+    subgraph Phase3["3. Project & Route"]
+        F --> G[Memory Encoder Network]
+        G -->|Semantics-Aware KV Routing| H[Layer/Head Gated States]
+        H -->|Inject Tensors| I[LLM past_key_values Cache]
     end
-    class AttentionProjection container;
+    class Phase3 container;
 
-    subgraph LLMExecution["LLM Generation Layer"]
-        LocalLLM["Local PyTorch LLM<br/>(GPT-2 on GPU)"]
-        OllamaLLM["Local Ollama Service<br/>(qwen2.5:1.5b on D:\OllamaModels)"]
+    subgraph Phase4["4. Compress & Decode"]
+        I -->|If Low VRAM| J[In-Flight KV Compressor]
+        J -->|Fidelity Checked Cache| K[Autoregressive LLM Decoder]
+        K -->|Prompt-Free Context| L[Generated Response]
     end
-    class LLMExecution active;
+    class Phase4 active;
 
-    subgraph SafetyLayer["Hardware Safety & Guard Subsystem"]
-        Win32NVML["C++ DLL Wrapper<br/>(safety_guard.dll)"]
-        RAMGuard["RAM Memory Guard<br/>(Win32 GlobalMemoryStatusEx)"]
-        VRAMGuard["VRAM Memory Guard<br/>(NVIDIA NVML Allocation Enforcer)"]
-        ThermalGuard["Thermal Cooldown Guard<br/>(Iterative Batch Sleep Restrictor)"]
-        GPULock["GPU Mutex Lock<br/>(Thread-Safe Serialized Access)"]
+    subgraph Safety["Safety Guard Runtime"]
+        S1[GPU Mutex Lock] -.->|Thread Serialization| K
+        S2[VRAM Guard] -.->|Flush PyTorch Cache| J
+        S3[Proportional Thermal Pacing] -.->|Smooth Micro-Delays| K
     end
-    class SafetyLayer hardware;
-
-    %% Connections
-    Shell -->|Input query| Embedder
-    Embedder -->|Query vector| Index
-    Index -->|Retrieve matching turn IDs| SQLStore
-    
-    SQLStore -->|Retrieve episodic turns| MEN
-    MEN -->|Generate key-value pairs| KVCache
-    KVCache -->|Low VRAM signal| Compressor
-    
-    KVCache -->|KV Cache Injection| LocalLLM
-    SQLStore -->|Chronologically sorted text RAG context| OllamaLLM
-    
-    LocalLLM -->|Generated response| Shell
-    OllamaLLM -->|Generated response| Shell
-    
-    %% Safety Locks Monitoring
-    Win32NVML --> RAMGuard
-    Win32NVML --> VRAMGuard
-    VRAMGuard -.->|VRAM status check| GPULock
-    GPULock -.->|Thread-safe lock execution| LocalLLM
-    ThermalGuard -.->|Rest cycles during training| LocalLLM
-
-    %% Dashboard Connections
-    SQLStore -->|Entity Graph Triples API| WebDash
-    Index -->|PCA 2D Projection API| WebDash
-    Win32NVML -->|System RAM & GPU VRAM stats| WebDash
+    class Safety hardware;
 ```
 
 ---
@@ -132,17 +105,20 @@ CGM uses a dense retrieval pipeline based on the SentenceTransformer model `all-
 ### SQLite Graph Store
 To visualize and structure conceptual relationships, CGM maintains a SQLite database (`cgm_memory.db`) storing turns, entity types, and relational triples (Subject, Predicate, Object). During generation, closed-loop extraction parses user inputs for semantic assertions (such as names, preferences, and roles) and dynamically expands the SQLite graph.
 
-### Memory Encoder Network (MEN)
-The Memory Encoder Network maps dialogue representations into the attention key-value space of the target LLM. The MEN takes the concatenated dense embeddings of the retrieved turns and projects them into key and value states corresponding to each layer and attention head of the LLM. These projected states are injected directly into the LLM's dynamic cache prior to prompt evaluation.
+### Memory Encoder Network (MEN) with SA-KVR
+The Memory Encoder Network maps dialogue representations directly into the attention key-value space of the target LLM. By default, it features **Semantics-Aware KV Cache Routing (SA-KVR)**:
+* An MLP gating network processes each semantic triple embedding on-the-fly and generates targeted head-wise and layer-wise scaling coefficients.
+* Keys and values are scaled by these routing weights before cache injection, ensuring specific attention heads and layers receive targeted memory evidence.
+* The injected states are directly populated in the `past_key_values` cache prior to evaluation.
 
 ### KV Cache Compressor
 Under constrained hardware environments, long conversations expand the KV cache and risk GPU out-of-memory errors. The KV Cache Compressor runs in the background. It measures KL-divergence across attention heads to identify redundant token representations and compress the cache length in-flight without degrading response quality.
 
-### C++ Hardware Guards
-Workstation GPUs (like the RTX A2000) require strict resource boundaries. The safety guard system calls native Windows APIs and NVIDIA NVML via `safety_guard.dll` to query memory and status:
-* **GPU Mutex Lock:** Serializes GPU executions to prevent concurrent memory allocation race conditions.
-* **VRAM Guard:** Flushes PyTorch's CUDA cache when VRAM drops below 800 MB, and crashes safely if memory is below 300 MB.
-* **Thermal Guard:** Imposes automatic pause intervals (cooling rests) during sustained prototype training.
+### C++ Hardware Guards & Proportional Thermal Pacing (PTP)
+Workstation and edge devices require strict resource boundaries. The safety guard system queries NVML and native Windows APIs to query system metrics:
+* **GPU Mutex Lock:** Serializes PyTorch and CUDA executions to prevent concurrent memory allocation races.
+* **VRAM Guard:** Proactively flushes PyTorch's CUDA cache when available memory drops below 800 MB, and aborts safely if memory is below 300 MB.
+* **Proportional Thermal Pacing (PTP):** Rather than hard-pausing training or inference (which triggers temperature spikes), the controller applies a quadratic cooldown pacing delay at batch boundaries to stabilize operating temperatures smoothly and prevent thermal throttling.
 
 ### Live Visualization Dashboard
 The visualization system runs a background HTTP server (port 8050) and launches a web browser. It features:
@@ -167,23 +143,24 @@ To validate the efficiency of Conversational Graph Memory (CGM) under resource-c
 
 1. **Approach A: Context Stuffing (Baseline):** Prepending the raw conversation text history directly to the prompt.
 2. **Approach B: Standard RAG (Summary Stuffing):** Prepending chronologically sorted, distilled summaries of retrieved context turns.
-3. **Approach C: TurboVec KV Cache Injection (Ours):** Retrieving relevant graph memory turns, projecting them into attention key-value states via the Memory Encoder Network (MEN), and injecting them directly into the LLM's dynamic KV cache.
-4. **Approach D: CGM-RAG + Compression (Ours):** Performing memory cache injection alongside double-buffered in-flight `KVCompressor` sequence reduction.
+3. **Approach C: CGM KV Injection (No Routing):** Projecting retrieved graph memory turns into attention key-value states via the Memory Encoder Network (MEN) without head-routing, injecting them directly into the LLM's dynamic KV cache.
+4. **Approach D: CGM KV Injection with SA-KVR Routing (Ours):** Cache injection utilizing Semantics-Aware KV Cache Routing (SA-KVR) to dynamically gate layer- and head-specific memory tensors.
+5. **Approach E: CGM-RAG + Routing + Compression (Ours):** Integrating cache routing alongside double-buffered in-flight `KVCompressor` sequence reduction.
 
-The following benchmark results were measured on an NVIDIA RTX A2000 Laptop GPU using `gpt2` as the base LLM and `all-MiniLM-L6-v2` as the embedding model:
+The following benchmark results were measured on an NVIDIA RTX A2000 Laptop GPU using `Qwen/Qwen2.5-0.5B-Instruct` as the base generative GQA model and `all-MiniLM-L6-v2` as the embedding model:
 
-| Performance Metric | Approach A: Context Stuffing (Baseline) | Approach B: Standard RAG (Summary Stuffing) | Approach C: TurboVec KV Injection | Approach D: CGM-RAG + Compression | CGM C vs A Improvement |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Input Context Token Count** | 220 | 96 | **21** | **21** | **-90.5% Tokens** |
-| **Virtual Memory Tokens** | 0 | 0 | 8 (KV injected) | 45 (Compressed) | Bypasses Input Window |
-| **Inference Generation Latency** | 0.4995s | 0.3522s | **0.4467s** | **0.5996s** | **-10.6% Latency** |
-| **Active Hardware Guards** | None | None | VRAM, Thread & Thermals | VRAM, Thread, Thermals & C++ RAM | Hardware Secure |
+| Performance Metric | Approach A: Stuffing | Approach B: RAG | Approach C: CGM (No Routing) | Approach D: CGM + SA-KVR (Ours) | Approach E: CGM + SA-KVR + Comp. | CGM D vs A Improvement |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Input Context Token Count** | 212 | 96 | **20** | **20** | **20** | **-90.6% Tokens** |
+| **Virtual Memory Tokens** | 0 | 0 | 8 (KV injected) | 8 (Routed) | 68 (Compressed) | Bypasses Input Window |
+| **Inference Generation Latency** | 1.9712s | 1.6814s | **2.0087s** | **2.0755s** | **2.8600s** | **+5.3% Latency** |
+| **Active Hardware Guards** | None | None | VRAM, Thread/Thermal | VRAM, Thread/Thermal | VRAM, Thread/Thermal | Hardware Secure |
 
 ### Key Takeaways
 
-* **Massive Token Context Savings (-90.5%):** Traditional context stuffing forces the language model to parse raw historical transcripts, incurring quadratic $O(L^2)$ computation costs on self-attention. CGM projects retrieved memories directly into KV space via the MEN, sending only the immediate user prompt to the model's active window to achieve a 90.5% reduction in input tokens.
-* **Prefill Speedup and Latency Reduction (-10.6%):** By injecting pre-computed KV states directly into the generation cache, the model bypasses the prefill phase entirely and proceeds directly to autoregressive decoding over a rectangular attention space.
-* **Dynamic In-Flight Cache Compression:** For long sequences, the asynchronous background `KVCompressor` dynamically groups and quantizes low-salience key-value states along the sequence length dimension, checking logits with a KL divergence gate to maintain output quality while saving VRAM.
+* **Massive Token Context Savings (-90.6%):** Traditional context stuffing forces the language model to parse raw historical transcripts, incurring quadratic $O(L^2)$ computation costs on self-attention. CGM projects retrieved memories directly into KV space, sending only the immediate user prompt to the model's active window to achieve a 90.6% reduction in input tokens.
+* **Semantics-Aware Cache Routing:** Introducing the gating routing network scales and routes the memory projections layer-by-layer and head-by-head based on structural semantics of triples. This adds minimum computational overhead (2.0755s vs 2.0087s) while ensuring highly targeted memory integration into transformer weights.
+* **Prefill Bypass and Window Conservation:** By bypassing the prompt prefill phase entirely, CGM keeps the prompt input length fixed at the size of the immediate query, ensuring that context window space is conserved indefinitely for agent dialogue coherence.
 
 ---
 

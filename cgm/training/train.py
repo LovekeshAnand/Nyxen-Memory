@@ -40,7 +40,10 @@ class MEGATrainer:
             # Convert raw tuples to DynamicCache
             past_key_values = DynamicCache()
             for idx, (k, v) in enumerate(raw_kv_tuples):
-                past_key_values.update(k, v, idx)
+                # Cast to match the target model's dtype (e.g. bfloat16/float16) to prevent RuntimeError
+                k_cast = k.to(dtype=self.pipeline.model.dtype)
+                v_cast = v.to(dtype=self.pipeline.model.dtype)
+                past_key_values.update(k_cast, v_cast, idx)
 
             # 2. Prepare inputs for LLM forward pass
             inputs = torch.cat([prompt_ids, target_ids], dim=-1).to(self.pipeline.device)
