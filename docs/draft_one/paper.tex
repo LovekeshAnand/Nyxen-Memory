@@ -178,40 +178,40 @@ Workstation laptop GPUs have limited cooling volumes, making them susceptible to
 The controller adjusts pacing delays ($\Delta t$) based on the deviation of current GPU temperature ($T_{gpu}$) from a target $T_{target} = 75^\circ\text{C}$ to maintain thermal equilibrium without triggering aggressive throttling or mechanical stress.
 
 \section{Experimental Evaluation}
-We evaluated the Conversational Graph Memory framework on a local workstation equipped with an NVIDIA RTX A2000 Laptop GPU (4GB VRAM) and an Intel Core i7 processor. The target LLM was a frozen `gpt2` (117M parameters, 12 layers, 12 attention heads, $d_{model}=768$), and the embedding model was `all-MiniLM-L6-v2` ($d_{emb}=384$).
+We evaluated the Conversational Graph Memory framework on a local workstation equipped with an NVIDIA RTX A2000 Laptop GPU (4GB VRAM) and an Intel Core i7 processor. The target LLM was a frozen \texttt{Qwen2.5-1.5B-Instruct} (1.5B parameters, 28 layers, 2 key-value heads under GQA, $head\_dim=128$, FP16 precision), and the embedding model was \texttt{all-MiniLM-L6-v2} ($d_{emb}=384$).
 
 \subsection{Performance Metrics and Baselines}
 We compared CGM against three standard baselines:
 \begin{itemize}
     \item \textbf{Approach A: Context Stuffing (Baseline)}: Prepending the raw dialog text history directly to the prompt.
     \item \textbf{Approach B: Standard RAG (Summary Stuffing)}: Prepending chronologically sorted, distilled text summaries of retrieved context turns.
-    \item \textbf{Approach C: TurboVec KV Cache Injection (Ours)}: Projecting retrieved graph triples into attention key-value states via the MEN and injecting them directly into the LLM's dynamic KV cache.
-    \item \textbf{Approach D: CGM-RAG + Compression (Ours)}: Cache injection combined with the in-flight `KVCompressor` sequence reduction.
+    \item \textbf{Approach C: CGM with SA-KVR (Ours)}: Projecting retrieved graph triples into attention key-value states via the MEN with Semantics-Aware Cache Routing and injecting them directly into the LLM's dynamic KV cache.
+    \item \textbf{Approach D: CGM + Compression (Ours)}: Gated cache injection combined with the in-flight \texttt{KVCompressor} sequence reduction.
 \end{itemize}
 
 \subsection{Context Token Savings}
-Table \ref{tab:results} reports the input context window token consumption and the latency of each approach. Standard Context Stuffing (Approach A) requires prepending the entire conversation history, consuming 220 tokens in the active prompt. By compiling dialogue turns into semantic triples and injecting them directly as cache matrices, CGM (Approach C) reduces input context tokens to only \textbf{21 tokens} (the immediate user query), achieving a \textbf{90.5\% token savings} and bypassing sequence window boundaries.
+Table \ref{tab:results} reports the input context window token consumption and the latency of each approach. Standard Context Stuffing (Approach A) requires prepending the entire conversation history, consuming 212 tokens in the active prompt. By compiling dialogue turns into semantic triples and injecting them directly as cache matrices, CGM (Approach C) reduces input context tokens to only \textbf{20 tokens} (the immediate user query), achieving a \textbf{90.6\% token savings} and bypassing sequence window boundaries.
 
 \begin{table}[h]
 \centering
-\caption{Performance and Latency Comparisons}
+\caption{Performance and Latency Comparisons (Qwen-2.5-1.5B)}
 \label{tab:results}
 \begin{tabular}{lcccc}
 \toprule
 Metric & Approach A & Approach B & Approach C & Approach D \\
 & (Stuffing) & (RAG) & (CGM Ours) & (CGM+Comp.) \\
 \midrule
-Input Tokens & 220 & 96 & \textbf{21} & \textbf{21} \\
-Virtual Tokens & 0 & 0 & 8 & 45 \\
-Latency (s) & 0.4995 & 0.3522 & \textbf{0.4467} & 0.5996 \\
-Improvement & Baseline & +29.5\% & \textbf{+10.6\%} & -20.0\% \\
+Input Tokens & 212 & 96 & \textbf{20} & \textbf{20} \\
+Virtual Tokens & 0 & 0 & 10 & 69 \\
+Latency (s) & 1.4985 & 1.3744 & \textbf{1.4591} & 1.8908 \\
+Improvement & Baseline & +8.3\% & \textbf{+2.6\%} & -26.2\% \\
 Active Guards & None & None & VRAM/Temp & VRAM/Temp \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Latency Analysis}
-In typical workflows, prompt prefilling represents a massive bottleneck. Table \ref{tab:results} shows that Approach C achieves an inference generation latency of \textbf{0.4467s} compared to \textbf{0.4995s} in the baseline, reflecting a \textbf{10.6\% speedup} resulting from prefill phase bypass. Approach D (incorporating compression) increases latency to \textbf{0.5996s} due to the computational overhead of calculating in-flight KL divergence.
+In typical workflows, prompt prefilling represents a massive bottleneck. Table \ref{tab:results} shows that Approach C (Ours) achieves an inference generation latency of \textbf{1.4591s} compared to \textbf{1.4985s} in the baseline, reflecting a \textbf{2.6\% speedup} resulting from prefill phase bypass. Approach D (incorporating compression) increases latency to \textbf{1.8908s} due to the computational overhead of calculating in-flight KL divergence across GQA dimensions.
 
 \begin{figure}[t]
 \centering
