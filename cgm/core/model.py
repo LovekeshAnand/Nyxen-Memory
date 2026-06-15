@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Any
 
 class MemoryEncoderNetwork(nn.Module):
     """
@@ -115,4 +115,60 @@ class MemoryEncoderNetwork(nn.Module):
             past_key_values.append((k_states, v_states))
 
         return past_key_values
+
+    def get_gate_stats(self, x: torch.Tensor) -> Dict[str, Any]:
+        """
+        Introspects the routing gate values for a given input tensor.
+        Used for ablation analysis to determine if routing is meaningful or a no-op.
+        
+        Args:
+            x: Input tensor representing M triples. Shape: (batch_size, M, input_dim)
+            
+        Returns:
+            Dict with per-layer/head gate statistics: mean, std, min, max, 
+            fraction near 1.0 (>0.9), fraction near 0.0 (<0.1).
+        """
+        import numpy as np
+        
+        if not self.use_routing:
+            return {"routing_enabled": False, "message": "Routing is disabled."}
+        
+        self.eval()
+        with torch.no_grad():
+            gates = self.routing_gate(x)  # (batch, M, num_layers * num_heads)
+        
+        # Reshape to (batch, M, num_layers, num_heads)
+        batch_size, M, _ = x.shape
+        gates_reshaped = gates.view(batch_size, M, self.num_layers, self.num_heads)
+        
+        # Global statistics
+        gate_vals = gates_reshaped.cpu().numpy().flatten()
+        global_stats = {
+            "routing_enabled": True,
+            "total_gates": len(gate_vals),
+            "global_mean": float(np.mean(gate_vals)),
+            "global_std": float(np.std(gate_vals)),
+            "global_min": float(np.min(gate_vals)),
+            "global_max": float(np.max(gate_vals)),
+            "frac_near_one": float(np.mean(gate_vals > 0.9)),
+            "frac_near_zero": float(np.mean(gate_vals < 0.1)),
+            "frac_mid_range": float(np.mean((gate_vals >= 0.1) & (gate_vals <= 0.9))),
+        }
+        
+        # Per-layer statistics
+        per_layer = []
+        for layer_idx in range(self.num_layers):
+            layer_gates = gates_reshaped[:, :, layer_idx, :].cpu().numpy().flatten()
+            per_layer.append({
+                "layer": layer_idx,
+                "mean": float(np.mean(layer_gates)),
+                "std": float(np.std(layer_gates)),
+                "min": float(np.min(layer_gates)),
+                "max": float(np.max(layer_gates)),
+                "frac_near_one": float(np.mean(layer_gates > 0.9)),
+                "frac_near_zero": float(np.mean(layer_gates < 0.1)),
+            })
+        global_stats["per_layer"] = per_layer
+        
+        return global_stats
 

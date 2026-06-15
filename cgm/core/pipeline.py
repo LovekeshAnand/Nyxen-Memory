@@ -172,7 +172,7 @@ class CGMPipeline:
         if self._retriever is None: self.initialize()
         return self._retriever
 
-    def generate(self, conversation_id: str, query_text: str, k: int = 15, max_new_tokens: int = 100, mode: str = "inject") -> str:
+    def generate(self, conversation_id: str, query_text: str, k: int = 15, max_new_tokens: int = 100, mode: str = "inject", do_sample: bool = True) -> str:
         """
         Runs pipeline: retrieves memories -> projects memory -> injects KVs -> generates response.
         Fully protected by VRAM guards, thread locks, and input bounds checking.
@@ -198,11 +198,13 @@ class CGMPipeline:
             mode = "text"
             
         if mode == "inject" and memories:
-            print(f"[Pipeline] Extracted {len(memories)} relevant turns. Encoding memory triples...")
+            # Sort retrieved memories chronologically by turn_id to align with training sequence order
+            sorted_memories = sorted(memories, key=lambda m: m.turn_id)
+            print(f"[Pipeline] Extracted {len(sorted_memories)} relevant turns. Encoding memory triples...")
             try:
                 from cgm.visualization.visualize import log_pipeline_event
                 log_pipeline_event("info", {
-                    "message": f"Projecting {len(memories)} retrieved turns into synthetic KV cache matrices."
+                    "message": f"Projecting {len(sorted_memories)} retrieved turns into synthetic KV cache matrices."
                 })
             except Exception:
                 pass
@@ -214,7 +216,7 @@ class CGMPipeline:
             with self.store._lock:
                 conn = self.store._get_connection()
                 cursor = conn.cursor()
-                for mem in memories:
+                for mem in sorted_memories:
                     cursor.execute("""
                         SELECT subject, predicate, object FROM triples
                         WHERE conversation_id = ? AND turn_id = ?
@@ -375,19 +377,30 @@ class CGMPipeline:
                 
             with torch.no_grad():
                 with GPULockManager():
-                    outputs = self.model.generate(
-                        inputs.input_ids,
-                        past_key_values=past_key_values,
-                        max_new_tokens=max_new_tokens,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        attention_mask=full_attention_mask,
-                        position_ids=position_ids,
-                        do_sample=True,
-                        temperature=0.8,
-                        top_k=50,
-                        top_p=0.95,
-                        repetition_penalty=1.2
-                    )
+                    if do_sample:
+                        outputs = self.model.generate(
+                            inputs.input_ids,
+                            past_key_values=past_key_values,
+                            max_new_tokens=max_new_tokens,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            attention_mask=full_attention_mask,
+                            position_ids=position_ids,
+                            do_sample=True,
+                            temperature=0.8,
+                            top_k=50,
+                            top_p=0.95,
+                            repetition_penalty=1.2
+                        )
+                    else:
+                        outputs = self.model.generate(
+                            inputs.input_ids,
+                            past_key_values=past_key_values,
+                            max_new_tokens=max_new_tokens,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            attention_mask=full_attention_mask,
+                            position_ids=position_ids,
+                            do_sample=False
+                        )
                     
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             if response.startswith(prompt):

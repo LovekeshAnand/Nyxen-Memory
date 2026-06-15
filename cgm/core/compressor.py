@@ -258,6 +258,9 @@ class KVCompressor:
             score_label = "KL Divergence"
         logger.info(f"[Compressor] Compression evaluated. Sequence length: {seq_len} -> {cache.get_seq_length()}. {score_label}: {fidelity_score:.4f}")
         
+        self.last_pre_len = seq_len
+        self.last_fidelity_score = fidelity_score
+        
         if fidelity_score > self.kl_threshold:
             # Revert to original cache
             logger.warning(f"[Compressor] {score_label} ({fidelity_score:.4f}) exceeds threshold ({self.kl_threshold}). Reverting cache...")
@@ -265,6 +268,8 @@ class KVCompressor:
                 k_orig, v_orig = _get_layer_k_v(original_cache, idx)
                 _set_layer_k_v(cache, idx, k_orig, v_orig)
             
+            self.last_post_len = seq_len
+            self.last_accepted = False
             try:
                 from cgm.visualization.visualize import log_pipeline_event
                 log_pipeline_event("compress", {
@@ -278,6 +283,8 @@ class KVCompressor:
                 pass
             return False
             
+        self.last_post_len = cache.get_seq_length()
+        self.last_accepted = True
         logger.info(f"[Compressor] Compression accepted. Saved {seq_len - cache.get_seq_length()} KV positions.")
         
         try:

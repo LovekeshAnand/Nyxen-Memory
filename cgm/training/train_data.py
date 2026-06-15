@@ -21,7 +21,11 @@ class TripleTrainingSample:
 
 # Handcrafted QA pairs for each triple in the benchmark dataset.
 # Each triple maps to a (prompt, target) pair for teacher-forced training.
+# Organized across 5 topic domains for statistical robustness (35+ total triples).
 TRIPLE_QA_MAP: Dict[str, Dict[str, Any]] = {
+    # ═══════════════════════════════════════════════════════════
+    # DOMAIN 1: Backend API Setup (9 triples)
+    # ═══════════════════════════════════════════════════════════
     "Project|uses|FastAPI": {
         "prompts": [
             "User: What backend web framework is used in the project?\nAssistant:",
@@ -92,23 +96,275 @@ TRIPLE_QA_MAP: Dict[str, Dict[str, Any]] = {
         ],
         "target": "Ruff has a max line length setting of 100 characters."
     },
+
+    # ═══════════════════════════════════════════════════════════
+    # DOMAIN 2: ML Model Training Configuration (7 triples)
+    # ═══════════════════════════════════════════════════════════
+    "Model|uses_optimizer|AdamW": {
+        "prompts": [
+            "User: What optimizer are we using for model training?\nAssistant:",
+            "User: Which optimization algorithm is configured for the training run?\nAssistant:",
+        ],
+        "target": "The model uses AdamW as the optimizer for training."
+    },
+    "Training|has_learning_rate|3e-4": {
+        "prompts": [
+            "User: What learning rate did we set for training?\nAssistant:",
+            "User: What is the configured learning rate for the model?\nAssistant:",
+        ],
+        "target": "The training learning rate is set to 3e-4."
+    },
+    "Training|has_batch_size|32": {
+        "prompts": [
+            "User: What batch size are we using for training?\nAssistant:",
+            "User: What is the training batch size we configured?\nAssistant:",
+        ],
+        "target": "The training batch size is 32."
+    },
+    "Training|runs_on|A100 GPU": {
+        "prompts": [
+            "User: What GPU are we using for model training?\nAssistant:",
+            "User: Which GPU hardware is the training running on?\nAssistant:",
+        ],
+        "target": "The training runs on an A100 GPU."
+    },
+    "Training|uses_dataset|ImageNet": {
+        "prompts": [
+            "User: What dataset are we training the model on?\nAssistant:",
+            "User: Which dataset is used for the training run?\nAssistant:",
+        ],
+        "target": "The training uses the ImageNet dataset."
+    },
+    "Model|has_architecture|ResNet-50": {
+        "prompts": [
+            "User: What is the model architecture we selected?\nAssistant:",
+            "User: Which neural network architecture are we training?\nAssistant:",
+        ],
+        "target": "The model architecture is ResNet-50."
+    },
+    "Training|has_epochs|100": {
+        "prompts": [
+            "User: How many epochs are we training for?\nAssistant:",
+            "User: What is the total number of training epochs configured?\nAssistant:",
+        ],
+        "target": "The training is configured for 100 epochs."
+    },
+
+    # ═══════════════════════════════════════════════════════════
+    # DOMAIN 3: DevOps & Deployment (7 triples)
+    # ═══════════════════════════════════════════════════════════
+    "App|deploys_to|AWS": {
+        "prompts": [
+            "User: What cloud platform are we deploying to?\nAssistant:",
+            "User: Where is the application being deployed?\nAssistant:",
+        ],
+        "target": "The application deploys to AWS."
+    },
+    "Container|uses|Docker": {
+        "prompts": [
+            "User: What containerization tool are we using?\nAssistant:",
+            "User: Which container runtime is configured for the deployment?\nAssistant:",
+        ],
+        "target": "The container uses Docker for containerization."
+    },
+    "CI|uses|GitHub Actions": {
+        "prompts": [
+            "User: What CI/CD platform are we using?\nAssistant:",
+            "User: Which continuous integration system is set up?\nAssistant:",
+        ],
+        "target": "The CI pipeline uses GitHub Actions."
+    },
+    "Deployment|has_region|us-east-1": {
+        "prompts": [
+            "User: What AWS region are we deploying to?\nAssistant:",
+            "User: Which cloud region is configured for our deployment?\nAssistant:",
+        ],
+        "target": "The deployment region is us-east-1."
+    },
+    "Deployment|has_instance_type|t3.medium": {
+        "prompts": [
+            "User: What EC2 instance type are we using?\nAssistant:",
+            "User: Which instance type is configured for the server?\nAssistant:",
+        ],
+        "target": "The deployment uses t3.medium instance type."
+    },
+    "Monitoring|uses|Prometheus": {
+        "prompts": [
+            "User: What monitoring tool are we using?\nAssistant:",
+            "User: Which system monitoring solution is configured?\nAssistant:",
+        ],
+        "target": "The monitoring system uses Prometheus."
+    },
+    "LoadBalancer|is_type|ALB": {
+        "prompts": [
+            "User: What type of load balancer are we using?\nAssistant:",
+            "User: Which load balancer is configured for the deployment?\nAssistant:",
+        ],
+        "target": "The load balancer is an ALB (Application Load Balancer)."
+    },
+
+    # ═══════════════════════════════════════════════════════════
+    # DOMAIN 4: Frontend Project Setup (7 triples)
+    # ═══════════════════════════════════════════════════════════
+    "Frontend|uses|React": {
+        "prompts": [
+            "User: What frontend framework are we using?\nAssistant:",
+            "User: Which UI library is the frontend built with?\nAssistant:",
+        ],
+        "target": "The frontend uses React as its UI framework."
+    },
+    "StateManagement|uses|Zustand": {
+        "prompts": [
+            "User: What state management library are we using?\nAssistant:",
+            "User: Which state management solution is configured for the frontend?\nAssistant:",
+        ],
+        "target": "The state management uses Zustand."
+    },
+    "Styling|uses|TailwindCSS": {
+        "prompts": [
+            "User: What CSS framework are we using for styling?\nAssistant:",
+            "User: Which styling solution is configured for the frontend?\nAssistant:",
+        ],
+        "target": "The styling uses TailwindCSS."
+    },
+    "Testing|uses|Vitest": {
+        "prompts": [
+            "User: What testing framework are we using for the frontend?\nAssistant:",
+            "User: Which test runner is configured for the project?\nAssistant:",
+        ],
+        "target": "The testing framework is Vitest."
+    },
+    "BuildTool|is|Vite": {
+        "prompts": [
+            "User: What build tool are we using for the frontend?\nAssistant:",
+            "User: Which bundler is configured for the frontend project?\nAssistant:",
+        ],
+        "target": "The build tool is Vite."
+    },
+    "PackageManager|is|pnpm": {
+        "prompts": [
+            "User: What package manager are we using?\nAssistant:",
+            "User: Which package manager is configured for the project?\nAssistant:",
+        ],
+        "target": "The package manager is pnpm."
+    },
+    "NodeVersion|is|20": {
+        "prompts": [
+            "User: What Node.js version are we using?\nAssistant:",
+            "User: Which Node version is configured for the project?\nAssistant:",
+        ],
+        "target": "The Node.js version is 20."
+    },
+
+    # ═══════════════════════════════════════════════════════════
+    # DOMAIN 5: Data Pipeline Configuration (7 triples)
+    # ═══════════════════════════════════════════════════════════
+    "Pipeline|uses|Apache Spark": {
+        "prompts": [
+            "User: What distributed processing framework are we using?\nAssistant:",
+            "User: Which data processing engine is configured for the pipeline?\nAssistant:",
+        ],
+        "target": "The pipeline uses Apache Spark for distributed processing."
+    },
+    "Storage|uses|S3": {
+        "prompts": [
+            "User: What object storage are we using for the data pipeline?\nAssistant:",
+            "User: Where is the pipeline data stored?\nAssistant:",
+        ],
+        "target": "The storage uses S3 for the data pipeline."
+    },
+    "DataFormat|is|Parquet": {
+        "prompts": [
+            "User: What file format are we using for the data?\nAssistant:",
+            "User: Which data format is configured for storage?\nAssistant:",
+        ],
+        "target": "The data format is Parquet."
+    },
+    "Scheduler|uses|Airflow": {
+        "prompts": [
+            "User: What workflow scheduler are we using?\nAssistant:",
+            "User: Which orchestration tool schedules the pipeline?\nAssistant:",
+        ],
+        "target": "The scheduler uses Airflow for workflow orchestration."
+    },
+    "AnalyticsDB|is|DuckDB": {
+        "prompts": [
+            "User: What analytics database are we using?\nAssistant:",
+            "User: Which analytical query engine is configured?\nAssistant:",
+        ],
+        "target": "The analytics database is DuckDB."
+    },
+    "Partitioning|has_key|date": {
+        "prompts": [
+            "User: What is the partitioning key for the data?\nAssistant:",
+            "User: Which column is used as the partition key?\nAssistant:",
+        ],
+        "target": "The partitioning key is date."
+    },
+    "Compression|uses|Snappy": {
+        "prompts": [
+            "User: What compression codec are we using for the data?\nAssistant:",
+            "User: Which compression algorithm is configured for the pipeline?\nAssistant:",
+        ],
+        "target": "The compression codec is Snappy."
+    },
 }
 
-# Deterministic train/eval split indices (by triple key order)
-# Train: 6 triples, Eval: 3 triples (disjoint)
+# ═══════════════════════════════════════════════════════════
+# Deterministic train/eval split (70/30 by domain)
+# Each domain contributes ~5 train + ~2 eval triples
+# ═══════════════════════════════════════════════════════════
 TRAIN_KEYS = [
+    # Domain 1: Backend (6 train)
     "Project|uses|FastAPI",
     "Database|connects_to|PostgreSQL",
     "Database|runs_on|Port 8080",
     "Database|uses|asyncpg",
     "Project|uses|Pydantic v2",
     "Project|formatted_by|Ruff",
+    # Domain 2: ML Training (5 train)
+    "Model|uses_optimizer|AdamW",
+    "Training|has_learning_rate|3e-4",
+    "Training|has_batch_size|32",
+    "Training|runs_on|A100 GPU",
+    "Training|uses_dataset|ImageNet",
+    # Domain 3: DevOps (5 train)
+    "App|deploys_to|AWS",
+    "Container|uses|Docker",
+    "CI|uses|GitHub Actions",
+    "Deployment|has_region|us-east-1",
+    "Deployment|has_instance_type|t3.medium",
+    # Domain 4: Frontend (5 train)
+    "Frontend|uses|React",
+    "StateManagement|uses|Zustand",
+    "Styling|uses|TailwindCSS",
+    "Testing|uses|Vitest",
+    "BuildTool|is|Vite",
+    # Domain 5: Data Pipeline (5 train)
+    "Pipeline|uses|Apache Spark",
+    "Storage|uses|S3",
+    "DataFormat|is|Parquet",
+    "Scheduler|uses|Airflow",
+    "AnalyticsDB|is|DuckDB",
 ]
 
 EVAL_KEYS = [
+    # Domain 1: Backend (3 eval)
     "Project|uses|typing_extensions",
     "Database|has_table|user_profiles",
     "Ruff|has_setting|Line length 100",
+    # Domain 2: ML Training (2 eval)
+    "Model|has_architecture|ResNet-50",
+    "Training|has_epochs|100",
+    # Domain 3: DevOps (2 eval)
+    "Monitoring|uses|Prometheus",
+    "LoadBalancer|is_type|ALB",
+    # Domain 4: Frontend (2 eval)
+    "PackageManager|is|pnpm",
+    "NodeVersion|is|20",
+    # Domain 5: Data Pipeline (2 eval)
+    "Partitioning|has_key|date",
+    "Compression|uses|Snappy",
 ]
 
 

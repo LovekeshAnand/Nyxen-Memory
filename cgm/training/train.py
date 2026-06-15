@@ -340,6 +340,8 @@ class MEGATrainer:
     ) -> Dict[str, Any]:
         """
         Full training loop with KV-distillation, multi-triple data, and eval-recall early stopping.
+        Accumulates gradients over all samples using leaf key-value tensors for optimal memory usage
+        on limited VRAM systems.
         
         Args:
             train_samples: Training set of TripleTrainingSample.
@@ -386,8 +388,9 @@ class MEGATrainer:
         x_all_arr = np.stack(unique_x_vectors)
         x_all_tensor = torch.tensor(x_all_arr, dtype=torch.float32).unsqueeze(0).to(self.pipeline.device)
         
-        # Pre-tokenize all samples
+        # Pre-tokenize all samples and pre-extract teacher KVs to speed up training
         tokenized_samples = []
+        print("  Pre-tokenizing samples and pre-extracting teacher KVs...")
         for sample in train_samples:
             # Find the index of this sample in the unique triples list
             triple_idx = -1
@@ -398,7 +401,12 @@ class MEGATrainer:
             
             prompt_ids = self.pipeline.tokenizer(sample.prompt_text, return_tensors="pt").input_ids.to(self.pipeline.device)
             target_ids = self.pipeline.tokenizer(sample.target_text, return_tensors="pt").input_ids.to(self.pipeline.device)
-            tokenized_samples.append((x_all_tensor, prompt_ids, target_ids, sample.triple_text, triple_idx))
+            
+            teacher_kv = None
+            if self.distill_lambda > 0 and sample.triple_text is not None:
+                teacher_kv = self._extract_teacher_kv(sample.triple_text)
+                
+            tokenized_samples.append((prompt_ids, target_ids, sample.triple_text, triple_idx, teacher_kv))
         
         # Dynamic Magnitude Calibration
         print("  Running dynamic magnitude calibration...")
@@ -453,22 +461,134 @@ class MEGATrainer:
         
         for epoch in range(1, epochs + 1):
             start_time = time.time()
+            self.pipeline.men.train()
+            optimizer.zero_grad()
             
-            # Shuffle training order each epoch (rotate by epoch for determinism)
+            # 1. Forward MEN once per epoch to get KVs for all triples
+            raw_kv_tuples = self.pipeline.men(x_all_tensor)
+            
+            # 2. Clone each KV tensor and set requires_grad=True to create leaf nodes
+            accum_k_list = []
+            accum_v_list = []
+            for k, v in raw_kv_tuples:
+                k_leaf = k.detach().clone().requires_grad_(True)
+                v_leaf = v.detach().clone().requires_grad_(True)
+                accum_k_list.append(k_leaf)
+                accum_v_list.append(v_leaf)
+                
+            # 3. Find the target attention dtype and extract rotary embeddings
+            # Find the target attention dtype
+            if hasattr(self.pipeline.model, "model") and hasattr(self.pipeline.model.model, "layers") and len(self.pipeline.model.model.layers) > 0:
+                attn_dtype = self.pipeline.model.model.layers[0].self_attn.q_proj.weight.dtype
+            else:
+                attn_dtype = next(self.pipeline.model.parameters()).dtype
+                
+            memory_length = x_all_tensor.shape[1]
+            if hasattr(self.pipeline.model.model, "rotary_emb"):
+                pos_ids = torch.arange(memory_length, dtype=torch.long, device=self.pipeline.device).unsqueeze(0)
+                dummy_x = torch.zeros(1, 1, memory_length, self.pipeline.model.config.hidden_size // self.pipeline.model.config.num_attention_heads).to(self.pipeline.device)
+                cos, sin = self.pipeline.model.model.rotary_emb(dummy_x, pos_ids)
+                cos_u = cos.unsqueeze(1).to(dtype=attn_dtype)
+                sin_u = sin.unsqueeze(1).to(dtype=attn_dtype)
+            else:
+                cos_u, sin_u = None, None
+                
+            # 4. Accumulate gradients over all samples
+            epoch_losses = {"total": [], "gen": [], "distill": []}
+            
+            # Shuffle training samples for stochastic flavor
             order = list(range(len(tokenized_samples)))
             np.random.seed(epoch)
             np.random.shuffle(order)
             
-            epoch_losses = {"total": [], "gen": [], "distill": []}
+            # Enforce memory safety
+            self.mem_guard.enforce_safety()
             
-            for sample_idx in order:
-                x_tensor, prompt_ids, target_ids, triple_text, triple_idx = tokenized_samples[sample_idx]
+            with GPULockManager():
+                for sample_idx in order:
+                    prompt_ids, target_ids, triple_text, triple_idx, teacher_kv = tokenized_samples[sample_idx]
+                    
+                    # Build fresh sample cache with RoPE applied for this sample to avoid autograd graph reuse errors
+                    sample_cache = DynamicCache()
+                    for idx in range(len(accum_k_list)):
+                        k_cast = accum_k_list[idx].to(dtype=attn_dtype)
+                        v_cast = accum_v_list[idx].to(dtype=attn_dtype)
+                        if cos_u is not None:
+                            k1 = k_cast[..., : k_cast.shape[-1] // 2]
+                            k2 = k_cast[..., k_cast.shape[-1] // 2 :]
+                            rot_k = torch.cat((-k2, k1), dim=-1)
+                            k_cast = (k_cast * cos_u) + (rot_k * sin_u)
+                        sample_cache.update(k_cast, v_cast, idx)
+                        
+                    # Prepare inputs
+                    inputs = torch.cat([prompt_ids, target_ids], dim=-1).to(self.pipeline.device)
+                    memory_mask = torch.ones(inputs.shape[0], memory_length, dtype=torch.long, device=self.pipeline.device)
+                    inputs_mask = torch.ones_like(inputs)
+                    attention_mask = torch.cat([memory_mask, inputs_mask], dim=-1)
+                    
+                    position_ids = torch.arange(
+                        memory_length, 
+                        memory_length + inputs.shape[-1], 
+                        dtype=torch.long, 
+                        device=self.pipeline.device
+                    ).unsqueeze(0).expand(inputs.shape[0], -1)
+                    
+                    # Forward frozen LLM
+                    outputs = self.pipeline.model(
+                        inputs,
+                        past_key_values=sample_cache,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids
+                    )
+                    
+                    # Compute loss
+                    logits = outputs.logits
+                    prompt_len = prompt_ids.shape[-1]
+                    target_len = target_ids.shape[-1]
+                    shift_logits = logits[..., prompt_len - 1 : prompt_len + target_len - 1, :].contiguous()
+                    shift_labels = target_ids.contiguous()
+                    
+                    loss_gen = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    )
+                    
+                    loss_distill = torch.tensor(0.0, device=self.pipeline.device)
+                    if self.distill_lambda > 0 and teacher_kv is not None:
+                        # Slice the active triple's KVs from accum_k_list / accum_v_list
+                        sliced_men_kv = []
+                        for k_leaf, v_leaf in zip(accum_k_list, accum_v_list):
+                            sliced_men_kv.append((
+                                k_leaf[:, :, triple_idx:triple_idx+1, :],
+                                v_leaf[:, :, triple_idx:triple_idx+1, :]
+                            ))
+                        loss_distill = self._compute_distillation_loss(sliced_men_kv, teacher_kv)
+                        
+                    loss_total = loss_gen + self.distill_lambda * loss_distill
+                    loss_sample = loss_total / len(tokenized_samples)
+                    
+                    # Backward pass for the sample to accumulate gradients on accum_k_list and accum_v_list
+                    loss_sample.backward()
+                    
+                    epoch_losses["total"].append(loss_total.item())
+                    epoch_losses["gen"].append(loss_gen.item())
+                    epoch_losses["distill"].append(loss_distill.item())
+                    
+                # 5. Backward pass for MEN using the accumulated gradients
+                loss_men = 0.0
+                for idx, (k, v) in enumerate(raw_kv_tuples):
+                    if accum_k_list[idx].grad is not None:
+                        loss_men = loss_men + torch.sum(k * accum_k_list[idx].grad)
+                    if accum_v_list[idx].grad is not None:
+                        loss_men = loss_men + torch.sum(v * accum_v_list[idx].grad)
+                        
+                if isinstance(loss_men, torch.Tensor):
+                    loss_men.backward()
+                    
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.pipeline.men.parameters(), max_norm=1.0)
+                optimizer.step()
                 
-                losses = self.train_step(x_tensor, prompt_ids, target_ids, optimizer, triple_text=triple_text, triple_idx=triple_idx)
-                epoch_losses["total"].append(losses["loss_total"])
-                epoch_losses["gen"].append(losses["loss_gen"])
-                epoch_losses["distill"].append(losses["loss_distill"])
-            
             avg_total = np.mean(epoch_losses["total"])
             avg_gen = np.mean(epoch_losses["gen"])
             avg_distill = np.mean(epoch_losses["distill"])
@@ -477,8 +597,8 @@ class MEGATrainer:
             history["train_loss_gen"].append(avg_gen)
             history["train_loss_distill"].append(avg_distill)
             
-            # Eval every 5 epochs or on first/last
-            run_eval = (epoch % 5 == 0 or epoch == 1 or epoch == epochs)
+            # Eval every 10 epochs or on first/last
+            run_eval = (epoch % 10 == 0 or epoch == 1 or epoch == epochs)
             eval_recall_pct = -1.0
             
             if run_eval and eval_samples:
@@ -501,7 +621,7 @@ class MEGATrainer:
                     import copy
                     best_state_dict = copy.deepcopy(self.pipeline.men.state_dict())
                 else:
-                    epochs_without_improvement += 5  # We eval every 5 epochs
+                    epochs_without_improvement += 10  # We eval every 10 epochs
             
             duration = time.time() - start_time
             
