@@ -249,7 +249,8 @@ class CGMPipeline:
                 memory_length = x_tensor.shape[1]  # Number of memory positions (= total triples)
                 
                 # Pass through MEN to generate past_key_values (with memoization)
-                cache_key = hashlib.md5(x_tensor.cpu().numpy().tobytes()).hexdigest()
+                cache_key_bytes = bytes([1 if self.men.use_routing else 0]) + x_tensor.cpu().numpy().tobytes()
+                cache_key = hashlib.md5(cache_key_bytes).hexdigest()
                 
                 with torch.no_grad():
                     with GPULockManager():

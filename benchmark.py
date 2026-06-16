@@ -438,9 +438,10 @@ def run_recall_benchmarks(pipeline, conversation_id="test_conversation_99"):
         
         if approach == "Approach C (CGM Injection)":
             pipeline.men.use_routing = False
-            
+            pipeline._men_cache.clear()
         elif approach in ["Approach D (CGM Injection + SA-KVR Routing)", "Approach E (CGM-RAG + Routing + Compression)"]:
             pipeline.men.use_routing = True
+            pipeline._men_cache.clear()
             
         for qa in qa_pairs:
             query = qa["q"]
@@ -700,6 +701,7 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
     # APPROACH C: CGM KV Injection WITHOUT SA-KVR Routing
     # =========================================================================
     pipeline.men.use_routing = False
+    pipeline._men_cache.clear()
     inputs_c = pipeline.tokenizer(cgm_prompt, return_tensors="pt").to(pipeline.device)
     token_count_c = inputs_c.input_ids.shape[1]
     
@@ -720,6 +722,7 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
     # APPROACH D: CGM KV Injection WITH SA-KVR Routing (Ours)
     # =========================================================================
     pipeline.men.use_routing = True
+    pipeline._men_cache.clear()
     
     def gen_d():
         return pipeline.generate(conversation_id, query, k=10, max_new_tokens=max_new_tokens, mode='inject', do_sample=False)
@@ -735,6 +738,7 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
     # APPROACH E: CGM-RAG + Routing + Compression (Ours with active compressor)
     # =========================================================================
     pipeline.men.use_routing = True
+    pipeline._men_cache.clear()
     
     from cgm.core.compressor import KVCompressor
     compressor = KVCompressor(hot_window=4, kl_threshold=0.15) # small hot window to trigger compression on small sequence
