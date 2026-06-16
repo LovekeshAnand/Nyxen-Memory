@@ -224,6 +224,8 @@ def seed_database_for_benchmarks(pipeline, conversation_id="test_conversation_99
                 ["DecidedSetup", "uses_package", "typing_extensions"],
                 ["SystemState", "has_status", "degraded_performance"],
                 ["DevelopmentGoal", "targets_platform", "kubernetes"],
+                ["AnalyticsDB", "is", "ClickHouse"],
+                ["CacheStore", "rejected", "Redis"],
             ],
             "entities": [
                 {"name": "CurrentTask", "type": "Context", "description": "Active development task"},
@@ -234,6 +236,9 @@ def seed_database_for_benchmarks(pipeline, conversation_id="test_conversation_99
                 {"name": "degraded_performance", "type": "Status", "description": "Current system performance status"},
                 {"name": "DevelopmentGoal", "type": "Context", "description": "Target of the development cycle"},
                 {"name": "kubernetes", "type": "Platform", "description": "Orchestration platform for deployment"},
+                {"name": "ClickHouse", "type": "Technology", "description": "High-performance analytical database engine"},
+                {"name": "Redis", "type": "Technology", "description": "In-memory database rejected for caching"},
+                {"name": "CacheStore", "type": "Context", "description": "Cache database configuration state"},
             ],
         },
     ]
@@ -307,7 +312,7 @@ def train_men_on_dialogue_history(pipeline, conversation_id="test_conversation_9
         lr=5e-4,
     )
     
-    # Lo    print("[Benchmark] MEN training completed.")
+    print("[Benchmark] MEN training completed.")
 
 def analyze_routing_gates(pipeline, conversation_id="test_conversation_99"):
     print("\n[Benchmark] Analyzing routing gates of the trained Memory Encoder Network...")
@@ -566,9 +571,9 @@ def run_recall_benchmarks(pipeline, conversation_id="test_conversation_99"):
         
     return results
 
-def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db"):
+def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_memory.db", rank: int = 64):
     print("=" * 60)
-    print(f"  RUNNING BENCHMARKS FOR MODEL: {model_name}")
+    print(f"  RUNNING BENCHMARKS FOR MODEL: {model_name} (rank={rank})")
     print("=" * 60)
     
     # Clean up old database and index files to prevent indexing collisions in TurboVec
@@ -583,7 +588,7 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
                 
     # 1. Initialize E2E pipeline
     print(f"[Benchmark] Initializing pipeline and models on GPU for '{model_name}'...")
-    pipeline = CGMPipeline(model_name=model_name, db_path=db_path)
+    pipeline = CGMPipeline(model_name=model_name, db_path=db_path, rank=rank)
     # Bypass memory guard checks during benchmarks to prevent false-positives on 4GB VRAM GPU
     pipeline.mem_guard.enforce_safety = lambda *args, **kwargs: None
     pipeline.initialize()
@@ -871,6 +876,18 @@ def run_generalization_benchmarks(pipeline, conversation_id="test_conversation_9
             ),
             "key": "3e-4",
             "type": "distraction"
+        },
+        # 4. Temporal Update / Conflict Resolution
+        {
+            "q": "Initially we used DuckDB for analytics. Later, we migrated to ClickHouse. What database are we currently using for analytics?",
+            "key": "clickhouse",
+            "type": "temporal_update"
+        },
+        # 5. Negation
+        {
+            "q": "We decided not to use Redis for caching. What cache store did we reject?",
+            "key": "redis",
+            "type": "negation"
         }
     ]
     
@@ -903,10 +920,10 @@ def run_generalization_benchmarks(pipeline, conversation_id="test_conversation_9
         "Assistant: And the data pipeline?\n"
         "User: We use Apache Spark for processing, data stored on S3 in Parquet format. Airflow schedules it.\n"
         "Assistant: Analytics engine?\n"
-        "User: DuckDB for analytics. Data partitioned by date and compressed with Snappy.\n"
+        "User: Initially we used DuckDB for analytics. Later, we migrated to ClickHouse. Data partitioned by date and compressed with Snappy.\n"
         "Assistant: Perfect. Finally, what's our current system task and goal?\n"
-        "User: The current task aims to fix cache collision. Our decided setup uses package typing_extensions, but the system state has status degraded_performance. The development goal targets platform kubernetes.\n"
-        "Assistant: Understood, I've logged the active task, goals, and setup constraints.\n"
+        "User: The current task aims to fix cache collision. Our decided setup uses package typing_extensions, but the system state has status degraded_performance. The development goal targets platform kubernetes. Also we decided not to use Redis for caching.\n"
+        "Assistant: Understood, I've logged the active task, goals, setup constraints, and cache rejections.\n"
     )
     
     summary_context = (
@@ -915,8 +932,8 @@ def run_generalization_benchmarks(pipeline, conversation_id="test_conversation_9
         "ML training uses ResNet-50 with AdamW (lr=3e-4, batch=32) on A100 GPU, ImageNet dataset, 100 epochs. "
         "Deployment: AWS, Docker, GitHub Actions CI, us-east-1 region, t3.medium instances, Prometheus monitoring, ALB. "
         "Frontend: React, Zustand, TailwindCSS, Vitest, Vite, pnpm, Node 20. "
-        "Data pipeline: Apache Spark, S3, Parquet, Airflow scheduler, DuckDB analytics, date partitioning, Snappy compression. "
-        "Active task goals: fix cache collision, decided setup uses typing_extensions, system state is degraded_performance, development goal targets platform kubernetes.\n\n"
+        "Data pipeline: Apache Spark, S3, Parquet, Airflow scheduler, ClickHouse analytics (migrated from DuckDB), date partitioning, Snappy compression. "
+        "Active task goals: fix cache collision, decided setup uses typing_extensions, system state is degraded_performance, development goal targets platform kubernetes. Caching: rejected Redis.\n\n"
     )
     
     results = {}
@@ -1278,6 +1295,12 @@ if __name__ == "__main__":
         default="data/cgm_memory.db",
         help="Database path"
     )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=64,
+        help="Rank of the LowRankLinear MEN projection layers"
+    )
     # Also support positional argument for backward compatibility
     parser.add_argument(
         "model_pos",
@@ -1291,14 +1314,14 @@ if __name__ == "__main__":
     models_str = args.model_pos if args.model_pos else args.models
     models = [m.strip() for m in models_str.split(",") if m.strip()]
     
-    print(f"[Benchmark] Selected models for run: {models}")
+    print(f"[Benchmark] Selected models for run: {models} with rank={args.rank}")
     
     all_results = {}
     all_gate_stats = {}
     
     for model in models:
         try:
-            results, gate_stats = run_benchmarks_for_model(model_name=model, db_path=args.db_path)
+            results, gate_stats = run_benchmarks_for_model(model_name=model, db_path=args.db_path, rank=args.rank)
             all_results[model] = results
             all_gate_stats[model] = gate_stats
         except Exception as e:

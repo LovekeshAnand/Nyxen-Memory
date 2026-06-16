@@ -339,6 +339,20 @@ TRIPLE_QA_MAP: Dict[str, Dict[str, Any]] = {
         ],
         "target": "The development goal targets platform kubernetes."
     },
+    "AnalyticsDB|is|ClickHouse": {
+        "prompts": [
+            "User: What is our active analytics database after migration?\nAssistant:",
+            "User: Which analytics engine did we migrate to?\nAssistant:"
+        ],
+        "target": "We migrated to ClickHouse for analytics."
+    },
+    "CacheStore|rejected|Redis": {
+        "prompts": [
+            "User: What cache store did we decide not to use?\nAssistant:",
+            "User: Which cache database did we reject in our setup?\nAssistant:"
+        ],
+        "target": "We decided not to use Redis for caching."
+    },
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -380,6 +394,7 @@ TRAIN_KEYS = [
     # Domain 6: State & Goals (2 train)
     "CurrentTask|aims_to|fix_cache_collision",
     "DecidedSetup|uses_package|typing_extensions",
+    "AnalyticsDB|is|ClickHouse",
 ]
 
 EVAL_KEYS = [
@@ -402,6 +417,7 @@ EVAL_KEYS = [
     # Domain 6: State & Goals (2 eval)
     "SystemState|has_status|degraded_performance",
     "DevelopmentGoal|targets_platform|kubernetes",
+    "CacheStore|rejected|Redis",
 ]
 
 

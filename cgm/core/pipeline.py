@@ -24,10 +24,11 @@ class CGMPipeline:
     Loads the target LLM (locally via PyTorch or calls local Ollama endpoints),
     retrieves relevant subgraph memory, projects it to KV space, and runs inference.
     """
-    def __init__(self, model_name: str = "gpt2", db_path: str = "data/cgm_memory.db", device: str = None):
+    def __init__(self, model_name: str = "gpt2", db_path: str = "data/cgm_memory.db", device: str = None, rank: int = 64):
         self.db_path = db_path
         self.model_name = model_name
         self.device = device
+        self.rank = rank
         
         # Initialize GPU guards
         self.mem_guard = GPUMemoryGuard()
@@ -130,9 +131,9 @@ class CGMPipeline:
                 
                 # Initialize MEN model with routing enabled for architecture novelty
                 if verbose:
-                    print("[Pipeline] Initializing Memory Encoder Network (MEN) with Semantics-Aware Routing...")
+                    print(f"[Pipeline] Initializing Memory Encoder Network (MEN) with Semantics-Aware Routing (rank={self.rank})...")
                 # input_dim matches 2 * embedding dimension of all-MiniLM-L6-v2 (2 * 384 = 768)
-                self._men = MemoryEncoderNetwork(input_dim=768, num_layers=num_layers, num_heads=num_heads, head_dim=head_dim, use_routing=True)
+                self._men = MemoryEncoderNetwork(input_dim=768, num_layers=num_layers, num_heads=num_heads, head_dim=head_dim, use_routing=True, rank=self.rank)
                 self._men.to(self.device)
                 self._men.eval()
 
@@ -225,21 +226,50 @@ class CGMPipeline:
                 """, (conversation_id,))
                 all_conversation_triples = [[row["subject"], row["predicate"], row["object"]] for row in cursor.fetchall()]
                 
+                # 1. Gather primary triples from retrieved turns
+                primary_triples = []
                 for mem in sorted_memories:
                     cursor.execute("""
                         SELECT subject, predicate, object FROM triples
                         WHERE conversation_id = ? AND turn_id = ?
                     """, (conversation_id, mem.turn_id))
                     triple_rows = cursor.fetchall()
+                    for row in triple_rows:
+                        primary_triples.append([row["subject"], row["predicate"], row["object"]])
+                
+                if primary_triples:
+                    # Deduplicate primary triples
+                    seen_triples = set()
+                    unique_triples = []
+                    for trip in primary_triples:
+                        t_tuple = (trip[0].lower().strip(), trip[1].lower().strip(), trip[2].lower().strip())
+                        if t_tuple not in seen_triples:
+                            seen_triples.add(t_tuple)
+                            unique_triples.append(trip)
                     
-                    if triple_rows:
-                        # Encode each triple with proper [enc(subj||pred); enc(obj)] structure
-                        for row in triple_rows:
-                            triple = [row["subject"], row["predicate"], row["object"]]
-                            x_i = encode_triple(triple, self.retriever.embed_text, all_triples=all_conversation_triples)
-                            x_list.append(x_i)
-                    else:
-                        # Fallback: if no triples found, use turn text as both halves
+                    # 2. Extract entities to find 1-hop neighbors
+                    entities = set()
+                    for trip in unique_triples:
+                        entities.add(trip[0].lower().strip())
+                        entities.add(trip[2].lower().strip())
+                    
+                    # 3. Fetch neighbors from all_conversation_triples
+                    for trip in all_conversation_triples:
+                        t_tuple = (trip[0].lower().strip(), trip[1].lower().strip(), trip[2].lower().strip())
+                        if t_tuple not in seen_triples:
+                            s_clean = trip[0].lower().strip()
+                            o_clean = trip[2].lower().strip()
+                            if s_clean in entities or o_clean in entities:
+                                seen_triples.add(t_tuple)
+                                unique_triples.append(trip)
+                    
+                    # 4. Encode each of the gathered triples with proper structure
+                    for triple in unique_triples:
+                        x_i = encode_triple(triple, self.retriever.embed_text, all_triples=all_conversation_triples)
+                        x_list.append(x_i)
+                else:
+                    # Fallback: if no triples found, use turn text for each memory
+                    for mem in sorted_memories:
                         if mem.embedding is None:
                             turn_text = f"{mem.user_text} {mem.assistant_text}"
                             mem.embedding = self.retriever.embed_text(turn_text)

@@ -1,6 +1,29 @@
 import torch
 import torch.nn as nn
 from typing import Tuple, List, Dict, Any
+import math
+
+class LowRankLinear(nn.Module):
+    """
+    Low-Rank Linear projection layer (LoRA-style).
+    Decomposes a large projection matrix into a low-rank bottleneck with non-linearity.
+    """
+    def __init__(self, in_features: int, out_features: int, rank: int = 64):
+        super().__init__()
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.relu = nn.ReLU()
+        self.lora_B = nn.Linear(rank, out_features, bias=True)
+        
+        # Standard initialization
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.lora_B.weight, a=math.sqrt(5))
+        if self.lora_B.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.lora_B.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.lora_B.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lora_B(self.relu(self.lora_A(x)))
 
 class MemoryEncoderNetwork(nn.Module):
     """
@@ -9,7 +32,7 @@ class MemoryEncoderNetwork(nn.Module):
     of a target Frozen LLM for rectangular attention injection.
     """
     def __init__(self, input_dim: int = 768, num_layers: int = 12, 
-                 num_heads: int = 12, head_dim: int = 64, use_routing: bool = True):
+                 num_heads: int = 12, head_dim: int = 64, use_routing: bool = True, rank: int = 64):
         """
         Args:
             input_dim: Dimension of the triple representation [enc(subj || pred); enc(obj)] (e.g., 2 * 384 = 768)
@@ -17,6 +40,7 @@ class MemoryEncoderNetwork(nn.Module):
             num_heads: Number of key-value heads in the target LLM (e.g., 12 for GPT-2)
             head_dim: Dimension per key-value head in the target LLM (e.g., 64 for GPT-2)
             use_routing: Whether to use learned semantics-aware KV head/layer routing
+            rank: Rank of low-rank projections (LoRA style)
         """
         super().__init__()
         self.num_layers = num_layers
@@ -25,22 +49,13 @@ class MemoryEncoderNetwork(nn.Module):
         self.output_dim = num_heads * head_dim
         self.use_routing = use_routing
 
-        # Define key (K) and value (V) projection layers for each LLM layer
-        # Maps shape (batch, M, input_dim) -> (batch, M, num_heads * head_dim)
+        # Define key (K) and value (V) low-rank projection layers for each LLM layer
         self.k_projections = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, self.output_dim)
-            ) for _ in range(num_layers)
+            LowRankLinear(input_dim, self.output_dim, rank=rank) for _ in range(num_layers)
         ])
         
         self.v_projections = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, self.output_dim)
-            ) for _ in range(num_layers)
+            LowRankLinear(input_dim, self.output_dim, rank=rank) for _ in range(num_layers)
         ])
 
         # Per-layer LayerNorm for magnitude matching against the LLM's internal KV distribution.
