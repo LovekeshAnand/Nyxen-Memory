@@ -222,8 +222,23 @@ class MEGATrainer:
                 else:
                     loss_distill = self._compute_distillation_loss(raw_kv_tuples, teacher_kv)
             
+            # Compute routing regularization loss if routing is active
+            loss_routing_prior = torch.tensor(0.0, device=self.pipeline.device)
+            if self.pipeline.men.use_routing:
+                gates = self.pipeline.men.routing_gate(x_triples)
+                gates = gates.view(-1, self.pipeline.men.num_layers, self.pipeline.men.num_heads)
+                gates_mean_per_layer = gates.mean(dim=[0, 2])
+                
+                mu = (self.pipeline.men.num_layers - 1) / 2.0
+                sigma = 4.0
+                prior_target = []
+                for l in range(self.pipeline.men.num_layers):
+                    prior_target.append(np.exp(-((l - mu) ** 2) / (2.0 * (sigma ** 2))))
+                prior_target = torch.tensor(prior_target, dtype=torch.float32, device=self.pipeline.device)
+                loss_routing_prior = F.mse_loss(gates_mean_per_layer, prior_target)
+
             # 6. Combined loss
-            loss_total = loss_gen + self.distill_lambda * loss_distill
+            loss_total = loss_gen + self.distill_lambda * loss_distill + 0.1 * loss_routing_prior
 
             # 7. Backpropagation
             loss_total.backward()
@@ -235,6 +250,7 @@ class MEGATrainer:
             "loss_total": loss_total.item(),
             "loss_gen": loss_gen.item(),
             "loss_distill": loss_distill.item(),
+            "loss_routing_prior": loss_routing_prior.item(),
         }
 
     def evaluate_recall(self, eval_samples: List[TripleTrainingSample], x_all_tensor: torch.Tensor, max_new_tokens: int = 30) -> Dict[str, Any]:
@@ -574,6 +590,21 @@ class MEGATrainer:
                     epoch_losses["gen"].append(loss_gen.item())
                     epoch_losses["distill"].append(loss_distill.item())
                     
+                # Compute routing regularization loss for all triples
+                loss_routing_prior = torch.tensor(0.0, device=self.pipeline.device)
+                if self.pipeline.men.use_routing:
+                    gates = self.pipeline.men.routing_gate(x_all_tensor)
+                    gates = gates.view(-1, self.pipeline.men.num_layers, self.pipeline.men.num_heads)
+                    gates_mean_per_layer = gates.mean(dim=[0, 2])
+                    
+                    mu = (self.pipeline.men.num_layers - 1) / 2.0
+                    sigma = 4.0
+                    prior_target = []
+                    for l in range(self.pipeline.men.num_layers):
+                        prior_target.append(np.exp(-((l - mu) ** 2) / (2.0 * (sigma ** 2))))
+                    prior_target = torch.tensor(prior_target, dtype=torch.float32, device=self.pipeline.device)
+                    loss_routing_prior = F.mse_loss(gates_mean_per_layer, prior_target)
+                    
                 # 5. Backward pass for MEN using the accumulated gradients
                 loss_men = 0.0
                 for idx, (k, v) in enumerate(raw_kv_tuples):
@@ -583,6 +614,8 @@ class MEGATrainer:
                         loss_men = loss_men + torch.sum(v * accum_v_list[idx].grad)
                         
                 if isinstance(loss_men, torch.Tensor):
+                    # Add routing regularization loss
+                    loss_men = loss_men + 0.1 * loss_routing_prior
                     loss_men.backward()
                     
                 # Gradient clipping

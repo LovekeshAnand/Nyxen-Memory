@@ -198,8 +198,9 @@ class CGMPipeline:
             mode = "text"
             
         if mode == "inject" and memories:
-            # Sort retrieved memories chronologically by turn_id to align with training sequence order
-            sorted_memories = sorted(memories, key=lambda m: m.turn_id)
+            # Sort retrieved memories by score in ascending order so that the highest score (most relevant)
+            # sits at the end of the sequence, closest to prompt tokens (leveraging natural attention recency bias).
+            sorted_memories = sorted(memories, key=lambda m: getattr(m, "score", getattr(m, "similarity_score", 0.0)))
             print(f"[Pipeline] Extracted {len(sorted_memories)} relevant turns. Encoding memory triples...")
             try:
                 from cgm.visualization.visualize import log_pipeline_event
@@ -216,6 +217,14 @@ class CGMPipeline:
             with self.store._lock:
                 conn = self.store._get_connection()
                 cursor = conn.cursor()
+                
+                # Fetch all triples for this conversation to build paths
+                cursor.execute("""
+                    SELECT subject, predicate, object FROM triples
+                    WHERE conversation_id = ?
+                """, (conversation_id,))
+                all_conversation_triples = [[row["subject"], row["predicate"], row["object"]] for row in cursor.fetchall()]
+                
                 for mem in sorted_memories:
                     cursor.execute("""
                         SELECT subject, predicate, object FROM triples
@@ -227,7 +236,7 @@ class CGMPipeline:
                         # Encode each triple with proper [enc(subj||pred); enc(obj)] structure
                         for row in triple_rows:
                             triple = [row["subject"], row["predicate"], row["object"]]
-                            x_i = encode_triple(triple, self.retriever.embed_text)
+                            x_i = encode_triple(triple, self.retriever.embed_text, all_triples=all_conversation_triples)
                             x_list.append(x_i)
                     else:
                         # Fallback: if no triples found, use turn text as both halves

@@ -308,6 +308,37 @@ TRIPLE_QA_MAP: Dict[str, Dict[str, Any]] = {
         ],
         "target": "The compression codec is Snappy."
     },
+    # ═══════════════════════════════════════════════════════════
+    # DOMAIN 6: State & Goals (4 triples)
+    # ═══════════════════════════════════════════════════════════
+    "CurrentTask|aims_to|fix_cache_collision": {
+        "prompts": [
+            "User: What does the current task aim to do?\nAssistant:",
+            "User: What is the goal of our current active task?\nAssistant:"
+        ],
+        "target": "The current task aims to fix cache collision."
+    },
+    "DecidedSetup|uses_package|typing_extensions": {
+        "prompts": [
+            "User: What package does the decided setup use?\nAssistant:",
+            "User: Which library did we decide to use in our setup?\nAssistant:"
+        ],
+        "target": "The decided setup uses package typing_extensions."
+    },
+    "SystemState|has_status|degraded_performance": {
+        "prompts": [
+            "User: What is the current status of the system state?\nAssistant:",
+            "User: How is the system state currently performing?\nAssistant:"
+        ],
+        "target": "The system state has status degraded_performance."
+    },
+    "DevelopmentGoal|targets_platform|kubernetes": {
+        "prompts": [
+            "User: What platform does our development goal target?\nAssistant:",
+            "User: Which deployment platform are we targeting for development?\nAssistant:"
+        ],
+        "target": "The development goal targets platform kubernetes."
+    },
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -346,6 +377,9 @@ TRAIN_KEYS = [
     "DataFormat|is|Parquet",
     "Scheduler|uses|Airflow",
     "AnalyticsDB|is|DuckDB",
+    # Domain 6: State & Goals (2 train)
+    "CurrentTask|aims_to|fix_cache_collision",
+    "DecidedSetup|uses_package|typing_extensions",
 ]
 
 EVAL_KEYS = [
@@ -365,24 +399,54 @@ EVAL_KEYS = [
     # Domain 5: Data Pipeline (2 eval)
     "Partitioning|has_key|date",
     "Compression|uses|Snappy",
+    # Domain 6: State & Goals (2 eval)
+    "SystemState|has_status|degraded_performance",
+    "DevelopmentGoal|targets_platform|kubernetes",
 ]
 
 
-def encode_triple(triple: List[str], embed_fn) -> np.ndarray:
+def encode_triple(triple: List[str], embed_fn, all_triples: Optional[List[List[str]]] = None) -> np.ndarray:
     """
     Encodes a triple into a 768-dim vector using the proper [enc(subj||pred); enc(obj)] structure.
+    If all_triples is provided, it searches for 2-hop connected subgraphs and encodes them as a relational path.
     
     Args:
         triple: [subject, predicate, object]
         embed_fn: Function that takes a string and returns a 384-dim numpy vector.
+        all_triples: Optional list of all triples in the graph to find connected paths.
     
     Returns:
-        768-dim numpy vector: concat(enc(subj + " " + pred), enc(obj))
+        768-dim numpy vector: concat(enc(left_text), enc(right_text))
     """
-    sp_text = f"{triple[0]} {triple[1]}"
-    o_text = triple[2]
-    sp_emb = embed_fn(sp_text)   # shape: (384,)
-    o_emb = embed_fn(o_text)     # shape: (384,)
+    s, p, o = triple
+    left_text = f"{s} {p}"
+    right_text = o
+    
+    if all_triples:
+        # 1. Forward connection: find another triple starting with our object
+        forward_conn = None
+        for ot in all_triples:
+            if ot != triple and len(ot) >= 3 and ot[0].lower() == o.lower():
+                forward_conn = ot
+                break
+        
+        if forward_conn:
+            left_text = f"{s} {p} {o} {forward_conn[1]}"
+            right_text = forward_conn[2]
+        else:
+            # 2. Backward connection: find another triple ending with our subject
+            backward_conn = None
+            for ot in all_triples:
+                if ot != triple and len(ot) >= 3 and ot[2].lower() == s.lower():
+                    backward_conn = ot
+                    break
+            
+            if backward_conn:
+                left_text = f"{backward_conn[0]} {backward_conn[1]} {s} {p}"
+                right_text = o
+                
+    sp_emb = embed_fn(left_text)   # shape: (384,)
+    o_emb = embed_fn(right_text)     # shape: (384,)
     return np.concatenate([sp_emb, o_emb])  # shape: (768,)
 
 
@@ -404,7 +468,7 @@ def build_training_samples(triples: List[List[str]], embed_fn) -> List[TripleTra
             continue
         
         qa = TRIPLE_QA_MAP[key]
-        x_vec = encode_triple(triple, embed_fn)
+        x_vec = encode_triple(triple, embed_fn, all_triples=triples)
         triple_text = f"{triple[0]} {triple[1]} {triple[2]}"
         
         prompts = qa.get("prompts") or [qa.get("prompt")]

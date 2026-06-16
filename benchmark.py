@@ -205,6 +205,37 @@ def seed_database_for_benchmarks(pipeline, conversation_id="test_conversation_99
                 {"name": "Snappy", "type": "Technology", "description": "Compression codec"},
             ],
         },
+        {
+            "turn_id": 6,
+            "summary": (
+                "The current task aims to fix cache collision in our setup. "
+                "The decided setup uses the typing_extensions package to resolve typing conflicts. "
+                "The system state currently has degraded performance due to these collisions, "
+                "and the development goal targets platform kubernetes."
+            ),
+            "turn_text": (
+                "The current task aims to fix cache collision. Our decided setup uses package typing_extensions. "
+                "The system state has status degraded_performance, and the development goal targets platform kubernetes."
+            ),
+            "user_text": "What is the goal of our current task, and what package are we using?",
+            "assistant_text": "The goal is to fix cache collision. We decided setup uses package typing_extensions.",
+            "triples": [
+                ["CurrentTask", "aims_to", "fix_cache_collision"],
+                ["DecidedSetup", "uses_package", "typing_extensions"],
+                ["SystemState", "has_status", "degraded_performance"],
+                ["DevelopmentGoal", "targets_platform", "kubernetes"],
+            ],
+            "entities": [
+                {"name": "CurrentTask", "type": "Context", "description": "Active development task"},
+                {"name": "fix_cache_collision", "type": "Goal", "description": "Goal of fixing the cache collision bug"},
+                {"name": "DecidedSetup", "type": "Context", "description": "Configured system setup"},
+                {"name": "typing_extensions", "type": "Technology", "description": "Python library for backported type features"},
+                {"name": "SystemState", "type": "Context", "description": "Operational state of the system"},
+                {"name": "degraded_performance", "type": "Status", "description": "Current system performance status"},
+                {"name": "DevelopmentGoal", "type": "Context", "description": "Target of the development cycle"},
+                {"name": "kubernetes", "type": "Platform", "description": "Orchestration platform for deployment"},
+            ],
+        },
     ]
     
     total_triples = 0
@@ -291,9 +322,10 @@ def analyze_routing_gates(pipeline, conversation_id="test_conversation_99"):
         
     from cgm.training.train_data import encode_triple
     x_list = []
+    triples = [[row["subject"], row["predicate"], row["object"]] for row in rows]
     for row in rows:
         triple = [row["subject"], row["predicate"], row["object"]]
-        x_i = encode_triple(triple, pipeline.retriever.embed_text)
+        x_i = encode_triple(triple, pipeline.retriever.embed_text, all_triples=triples)
         x_list.append(x_i)
         
     if not x_list:
@@ -373,13 +405,18 @@ def run_recall_benchmarks(pipeline, conversation_id="test_conversation_99"):
         {"q": "What analytics database are we using?", "key": "duckdb"},
         {"q": "What is the partitioning key for the data?", "key": "date"},
         {"q": "What compression codec are we using for the data?", "key": "snappy"},
+        # Domain 6: State & Goals (4 facts)
+        {"q": "What does the current task aim to do?", "key": "fix_cache_collision"},
+        {"q": "What package does the decided setup use?", "key": "typing_extensions"},
+        {"q": "What is the current status of the system state?", "key": "degraded_performance"},
+        {"q": "What platform does our development goal target?", "key": "kubernetes"},
     ]
     
     results = {}
     max_new_tokens = 30
     
     # ═══════════════════════════════════════════════════════════
-    # CONTEXT TEXTS FOR APPROACH A & B (covering all 5 domains)
+    # CONTEXT TEXTS FOR APPROACH A & B (covering all 6 domains)
     # ═══════════════════════════════════════════════════════════
     long_history_text = (
         "System: You are a helpful assistant.\n"
@@ -410,7 +447,9 @@ def run_recall_benchmarks(pipeline, conversation_id="test_conversation_99"):
         "User: We use Apache Spark for processing, data stored on S3 in Parquet format. Airflow schedules it.\n"
         "Assistant: Analytics engine?\n"
         "User: DuckDB for analytics. Data partitioned by date and compressed with Snappy.\n"
-        "Assistant: Everything is documented. Let me know what to build next!\n"
+        "Assistant: Perfect. Finally, what's our current system task and goal?\n"
+        "User: The current task aims to fix cache collision. Our decided setup uses package typing_extensions, but the system state has status degraded_performance. The development goal targets platform kubernetes.\n"
+        "Assistant: Understood, I've logged the active task, goals, and setup constraints.\n"
     )
     
     summary_context = (
@@ -419,7 +458,8 @@ def run_recall_benchmarks(pipeline, conversation_id="test_conversation_99"):
         "ML training uses ResNet-50 with AdamW (lr=3e-4, batch=32) on A100 GPU, ImageNet dataset, 100 epochs. "
         "Deployment: AWS, Docker, GitHub Actions CI, us-east-1 region, t3.medium instances, Prometheus monitoring, ALB. "
         "Frontend: React, Zustand, TailwindCSS, Vitest, Vite, pnpm, Node 20. "
-        "Data pipeline: Apache Spark, S3, Parquet, Airflow scheduler, DuckDB analytics, date partitioning, Snappy compression.\n\n"
+        "Data pipeline: Apache Spark, S3, Parquet, Airflow scheduler, DuckDB analytics, date partitioning, Snappy compression. "
+        "Active task goals: fix cache collision, decided setup uses typing_extensions, system state is degraded_performance, development goal targets platform kubernetes.\n\n"
     )
     
     approaches = [
@@ -562,7 +602,7 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
     pipeline.retriever.store_turn = lambda *args, **kwargs: None
     
     # Set up scenarios
-    # A. Baseline context stuffing text (long history simulated - 5 domains)
+    # A. Baseline context stuffing text (long history simulated - 6 domains)
     long_history_text = (
         "System: You are a helpful assistant.\n"
         "User: Hello! I'm starting a new backend API project.\n"
@@ -592,7 +632,9 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
         "User: We use Apache Spark for processing, data stored on S3 in Parquet format. Airflow schedules it.\n"
         "Assistant: Analytics engine?\n"
         "User: DuckDB for analytics. Data partitioned by date and compressed with Snappy.\n"
-        "Assistant: Everything is documented. Let me know what to build next!\n"
+        "Assistant: Perfect. Finally, what's our current system task and goal?\n"
+        "User: The current task aims to fix cache collision. Our decided setup uses package typing_extensions, but the system state has status degraded_performance. The development goal targets platform kubernetes.\n"
+        "Assistant: Understood, I've logged the active task, goals, and setup constraints.\n"
         f"User: {query}\n"
         "Assistant:"
     )
@@ -604,7 +646,8 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
         "ML training uses ResNet-50 with AdamW (lr=3e-4, batch=32) on A100 GPU, ImageNet dataset, 100 epochs. "
         "Deployment: AWS, Docker, GitHub Actions CI, us-east-1 region, t3.medium instances, Prometheus monitoring, ALB. "
         "Frontend: React, Zustand, TailwindCSS, Vitest, Vite, pnpm, Node 20. "
-        "Data pipeline: Apache Spark, S3, Parquet, Airflow scheduler, DuckDB analytics, date partitioning, Snappy compression.\n\n"
+        "Data pipeline: Apache Spark, S3, Parquet, Airflow scheduler, DuckDB analytics, date partitioning, Snappy compression. "
+        "Active task goals: fix cache collision, decided setup uses typing_extensions, system state is degraded_performance, development goal targets platform kubernetes.\n\n"
         f"User: {query}\n"
         "Assistant:"
     )
@@ -763,12 +806,23 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
     # =========================================================================
     recall_rates = run_recall_benchmarks(pipeline, conversation_id)
     
+    # =========================================================================
+    # EVALUATE GENERALIZATION STRESS TEST SUITE
+    # =========================================================================
+    generalization_rates = run_generalization_benchmarks(pipeline, conversation_id)
+    
     # Merge recall data into results dict
     for approach_key in recall_rates:
         if approach_key in results:
             results[approach_key]["recall_rate"] = recall_rates[approach_key]["recall_rate"]
             results[approach_key]["adjusted_recall"] = recall_rates[approach_key]["adjusted_recall"]
             results[approach_key]["degenerate_count"] = recall_rates[approach_key]["degenerate_count"]
+            
+            # Merge generalization rates
+            if approach_key in generalization_rates:
+                results[approach_key]["generalization_rate"] = generalization_rates[approach_key]["generalization_rate"]
+                results[approach_key]["generalization_success"] = generalization_rates[approach_key]["successful_recalls"]
+                results[approach_key]["generalization_total"] = generalization_rates[approach_key]["total_queries"]
             
             # Copy compressor details if Approach E
             if approach_key == "Approach E (CGM-RAG + Routing + Compression)" and "last_pre_len" in recall_rates[approach_key]:
@@ -784,6 +838,185 @@ def run_benchmarks_for_model(model_name: str = "gpt2", db_path: str = "data/cgm_
     torch.cuda.empty_cache()
     
     return results, gate_stats
+
+def run_generalization_benchmarks(pipeline, conversation_id="test_conversation_99"):
+    print("\n============================================================")
+    print("      CONVERSATIONAL GRAPH MEMORY (CGM) - GENERALIZATION EVAL")
+    print("============================================================")
+    
+    generalization_qa_pairs = [
+        # 1. Unseen Phrasing (Zero-shot)
+        {
+            "q": "Can you recall the backend storage engine we're pointing our API to?", 
+            "key": "postgresql",
+            "type": "unseen_phrasing"
+        },
+        # 2. Multi-Hop Compositional Reasoning
+        {
+            "q": "What port is PostgreSQL running on, and what library connects to it?", 
+            "key": "8080", "key2": "asyncpg",
+            "type": "multi_hop"
+        },
+        {
+            "q": "Is our React frontend codebase compiled using pnpm or npm, and is the code written in Python?", 
+            "key": "pnpm", "key2": "no",
+            "type": "inference_logic"
+        },
+        # 3. Context Distractor (Attention Stress-Test)
+        {
+            "q": (
+                "We had a long discussion. Yesterday I went to the park and read a book about history. "
+                "It was sunny and warm outside. I cooked dinner with pasta and mushrooms. "
+                "By the way, what learning rate did we configure for our ResNet-50 training?"
+            ),
+            "key": "3e-4",
+            "type": "distraction"
+        }
+    ]
+    
+    # Context texts expanded for Turn 6
+    long_history_text = (
+        "System: You are a helpful assistant.\n"
+        "User: Hello! I'm starting a new backend API project.\n"
+        "Assistant: Great! What web framework are we using?\n"
+        "User: I've decided to use FastAPI for it. It's fast and easy.\n"
+        "Assistant: Awesome choice. What database should we connect?\n"
+        "User: We are using PostgreSQL. Let's run it on port 8080.\n"
+        "Assistant: Noted, Postgres on port 8080. What connector package?\n"
+        "User: We will use asyncpg for asynchronous database connections. Also typing_extensions for type hints.\n"
+        "Assistant: Understood. Any python validation libraries?\n"
+        "User: Yes, let's use Pydantic v2. Also, we will use user_profiles as a table.\n"
+        "Assistant: Got it. What formatting and linting setup?\n"
+        "User: Let's use Ruff for code formatting with a maximum line length of 100.\n"
+        "Assistant: Perfect. Now let's discuss the ML training setup.\n"
+        "User: We'll train a ResNet-50 model using AdamW optimizer with learning rate 3e-4 and batch size 32.\n"
+        "Assistant: What GPU and dataset?\n"
+        "User: Training runs on an A100 GPU using the ImageNet dataset for 100 epochs.\n"
+        "Assistant: Great. What about deployment?\n"
+        "User: The app deploys to AWS using Docker containers. CI uses GitHub Actions.\n"
+        "Assistant: Region and instance type?\n"
+        "User: We deploy to us-east-1 on t3.medium instances. Monitoring uses Prometheus and we use an ALB load balancer.\n"
+        "Assistant: Now let's discuss the frontend.\n"
+        "User: Frontend uses React with Zustand for state management and TailwindCSS for styling.\n"
+        "Assistant: Testing and build tools?\n"
+        "User: Testing uses Vitest, build tool is Vite, package manager is pnpm, Node version is 20.\n"
+        "Assistant: And the data pipeline?\n"
+        "User: We use Apache Spark for processing, data stored on S3 in Parquet format. Airflow schedules it.\n"
+        "Assistant: Analytics engine?\n"
+        "User: DuckDB for analytics. Data partitioned by date and compressed with Snappy.\n"
+        "Assistant: Perfect. Finally, what's our current system task and goal?\n"
+        "User: The current task aims to fix cache collision. Our decided setup uses package typing_extensions, but the system state has status degraded_performance. The development goal targets platform kubernetes.\n"
+        "Assistant: Understood, I've logged the active task, goals, and setup constraints.\n"
+    )
+    
+    summary_context = (
+        "Distilled Past Context: The user set up a backend API with FastAPI, PostgreSQL on port 8080, "
+        "asyncpg, typing_extensions, Pydantic v2, user_profiles table, Ruff formatter (line length 100). "
+        "ML training uses ResNet-50 with AdamW (lr=3e-4, batch=32) on A100 GPU, ImageNet dataset, 100 epochs. "
+        "Deployment: AWS, Docker, GitHub Actions CI, us-east-1 region, t3.medium instances, Prometheus monitoring, ALB. "
+        "Frontend: React, Zustand, TailwindCSS, Vitest, Vite, pnpm, Node 20. "
+        "Data pipeline: Apache Spark, S3, Parquet, Airflow scheduler, DuckDB analytics, date partitioning, Snappy compression. "
+        "Active task goals: fix cache collision, decided setup uses typing_extensions, system state is degraded_performance, development goal targets platform kubernetes.\n\n"
+    )
+    
+    results = {}
+    max_new_tokens = 30
+    
+    approaches = [
+        "Approach A (Context Stuffing)",
+        "Approach B (Standard RAG)",
+        "Approach C (CGM Injection)",
+        "Approach D (CGM Injection + SA-KVR Routing)",
+        "Approach E (CGM-RAG + Routing + Compression)"
+    ]
+    
+    cgm_prompt = "User: {query}\nAssistant:"
+    
+    for approach in approaches:
+        print(f"\n[Gen Eval] Evaluating {approach}...")
+        successful_recalls = 0
+        degenerate_count = 0
+        
+        if approach == "Approach C (CGM Injection)":
+            pipeline.men.use_routing = False
+            pipeline._men_cache.clear()
+        elif approach in ["Approach D (CGM Injection + SA-KVR Routing)", "Approach E (CGM-RAG + Routing + Compression)"]:
+            pipeline.men.use_routing = True
+            pipeline._men_cache.clear()
+            
+        details = []
+        for qa in generalization_qa_pairs:
+            query = qa["q"]
+            expected = qa["key"]
+            expected2 = qa.get("key2")
+            
+            if approach == "Approach A (Context Stuffing)":
+                full_prompt = f"{long_history_text}User: {query}\nAssistant:"
+                inputs = pipeline.tokenizer(full_prompt, return_tensors="pt").to(pipeline.device)
+                with torch.no_grad():
+                    outputs = pipeline.model.generate(
+                        inputs.input_ids,
+                        attention_mask=inputs.attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        pad_token_id=pipeline.tokenizer.pad_token_id
+                    )
+                resp = pipeline.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+            
+            elif approach == "Approach B (Standard RAG)":
+                full_prompt = f"{summary_context}User: {query}\nAssistant:"
+                inputs = pipeline.tokenizer(full_prompt, return_tensors="pt").to(pipeline.device)
+                with torch.no_grad():
+                    outputs = pipeline.model.generate(
+                        inputs.input_ids,
+                        attention_mask=inputs.attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        pad_token_id=pipeline.tokenizer.pad_token_id
+                    )
+                resp = pipeline.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+                
+            elif approach == "Approach C (CGM Injection)":
+                resp = pipeline.generate(conversation_id, query, k=10, max_new_tokens=max_new_tokens, mode='inject', do_sample=False)
+                
+            elif approach == "Approach D (CGM Injection + SA-KVR Routing)":
+                resp = pipeline.generate(conversation_id, query, k=10, max_new_tokens=max_new_tokens, mode='inject', do_sample=False)
+                
+            elif approach == "Approach E (CGM-RAG + Routing + Compression)":
+                from cgm.core.compressor import KVCompressor
+                compressor = KVCompressor(hot_window=4, kl_threshold=0.15)
+                resp = pipeline.generate(conversation_id, query, k=10, max_new_tokens=max_new_tokens, mode='inject', do_sample=False)
+                if pipeline.active_cache is not None:
+                    compressor.compress(pipeline, pipeline.active_cache)
+            
+            resp_clean = resp.replace("\n", " ").strip()
+            resp_token_count = len(pipeline.tokenizer.encode(resp_clean))
+            is_degenerate = resp_token_count <= 2
+            
+            if is_degenerate:
+                degenerate_count += 1
+                details.append({"q": query, "a": resp_clean, "status": "degenerate"})
+                print(f"  Q: '{query}'")
+                print(f"  A: '{resp_clean}' -> [DEGENERATE]")
+            else:
+                hit1 = expected in resp_clean.lower()
+                hit2 = True if expected2 is None else expected2 in resp_clean.lower()
+                has_recalled = hit1 and hit2
+                if has_recalled:
+                    successful_recalls += 1
+                details.append({"q": query, "a": resp_clean, "status": "success" if has_recalled else "fail"})
+                print(f"  Q: '{query}'")
+                print(f"  A: '{resp_clean}' -> {'[RECALLED]' if has_recalled else '[FAILED]'}")
+                
+        generalization_rate = (successful_recalls / len(generalization_qa_pairs)) * 100
+        print(f"  Result {approach}: {successful_recalls}/{len(generalization_qa_pairs)} recalled ({generalization_rate:.1f}%)")
+        
+        results[approach] = {
+            "generalization_rate": generalization_rate,
+            "degenerate_count": degenerate_count,
+            "successful_recalls": successful_recalls,
+            "total_queries": len(generalization_qa_pairs),
+            "details": details
+        }
+    return results
 
 def write_consolidated_report(all_results, all_gate_stats, output_md="data/benchmark_report.md", output_json="data/benchmark_results.json"):
     print("\n[Benchmark] Compiling and writing consolidated benchmarks results...")
@@ -860,6 +1093,33 @@ def write_consolidated_report(all_results, all_gate_stats, output_md="data/bench
             
     table_content = "\n".join(table_rows)
     
+    # Generate multi-model generalization table
+    gen_table_rows = []
+    for model_name, results in all_results.items():
+        clean_model = model_name.split("/")[-1]
+        first_row_for_model = True
+        for approach in [
+            "Approach A (Context Stuffing)",
+            "Approach B (Standard RAG)",
+            "Approach C (CGM Injection)",
+            "Approach D (CGM Injection + SA-KVR Routing)",
+            "Approach E (CGM-RAG + Routing + Compression)"
+        ]:
+            if approach not in results:
+                continue
+            r = results[approach]
+            model_cell = f"**{clean_model}**" if first_row_for_model else ""
+            
+            gen_rate = f"{r.get('generalization_rate', 0.0):.1f}%"
+            degen = r.get("degenerate_count", 0)
+            
+            gen_table_rows.append(
+                f"| {model_cell} | {approach.split(' (')[0]} | {gen_rate} | {degen} |"
+            )
+            first_row_for_model = False
+            
+    gen_table_content = "\n".join(gen_table_rows)
+    
     # Generate routing ablation section
     routing_section = ""
     for model_name, gate_stats in all_gate_stats.items():
@@ -931,6 +1191,16 @@ This document compiles the performance benchmarks of the **Conversational Graph 
 | Model | Approach | Input Context Tokens | Virtual Tokens | Median Latency (IQR) | Mean Latency ± Std | Peak GPU VRAM | Decoding Speed | Factual Recall | Degenerate | CGM D vs A Improvement |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 {table_content}
+
+---
+
+## 🧠 Generalization and Reasoning Stress Test Suite
+
+Evaluating the system's capacity to generalize to unseen phrasings, execute multi-hop compositional reasoning over relational chains, and resist context distraction.
+
+| Model | Approach | Generalization Rate | Degenerate Count |
+| :--- | :--- | :---: | :---: |
+{gen_table_content}
 
 ---
 

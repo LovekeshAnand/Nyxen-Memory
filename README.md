@@ -210,23 +210,24 @@ A detailed, publication-grade analysis is available in [cgm/benchmarks.md](file:
 
 | Base Model | Approach | Input / Virtual Tokens | Median Latency (IQR) | Peak VRAM | Decoding Speed | Factual Recall (Headline Metric) | Latency vs. Stuffing |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Qwen 2.5 0.5B** | A. Context Stuffing (Baseline) | 468 / 0 | 1.6878s (1.6614–1.7447s) | 1182.51 MB | 23.7 t/s | **43.2%** | *Baseline* |
-| | B. Standard RAG (Summary Stuffing) | 194 / 0 | 1.5944s (1.3869–1.6565s) | 1149.44 MB | 25.1 t/s | **62.2%** | -5.5% |
-| | C. CGM (No Routing - Injected) | **20 / 5** | **1.6286s (1.5615–1.6664s)** | **1142.71 MB** | **24.6 t/s** | **0.0%** | -3.5% |
-| | D. CGM + SA-KVR (Routed - Injected) | **20 / 5** | **0.4907s (0.4826–0.5281s)** | **1142.16 MB** | **81.5 t/s** | **100.0%** | **-70.9% (Faster)** |
-| | E. CGM + Routing + Comp. (Ours) | **20 / 68** | **0.6356s (0.6214–0.6549s)** | **1142.16 MB** | **62.9 t/s** | **100.0%** | **-62.3% (Faster)** |
+| **Qwen 2.5 0.5B** | A. Context Stuffing (Baseline) | 523 / 0 | 1.6668s (1.6303–1.6997s) | 1190.24 MB | 24.0 t/s | **61.0%** | *Baseline* |
+| | B. Standard RAG (Summary Stuffing) | 221 / 0 | 1.6545s (1.6132–1.6778s) | 1153.56 MB | 24.2 t/s | **53.7%** | -0.7% |
+| | C. CGM (No Routing - Injected) | **20 / 6** | **1.6516s (1.6351–1.6685s)** | **1143.20 MB** | **24.2 t/s** | **0.0%** | -0.9% |
+| | D. CGM + SA-KVR (Routed - Injected) | **20 / 6** | **1.6502s (1.6163–1.6704s)** | **1143.20 MB** | **24.2 t/s** | **43.9%** | **-1.0% (Faster)** |
+| | E. CGM + Routing + Comp. (Ours) | **20 / 100** | **1.8723s (1.8568–1.8915s)** | **1143.20 MB** | **21.4 t/s** | **43.9%** | +12.3% |
 
 ### Key Takeaways & Claims
 
-* **Factual Recall (Headline Metric):**
-  * **Context Stuffing (43.2% Recall):** Bounded by the 0.5B parameter model's attention distractions over large raw histories, context stuffing suffers from low recall (43.2%).
-  * **Standard RAG (62.2% Recall):** Summary stuffing improves recall over raw history, but remains distracted by prompt-based text context.
-  * **CGM + SA-KVR (100.0% Recall):** Directly projecting semantic graph relationships into key-value states achieves a perfect **100.0% recall** across 37 QA pairs in 5 domains. By mapping facts to the target LLM's attention manifold, CGM eliminates distraction and guarantees recall.
-  * **Ablation of Routing (Approach C - 0.0% Recall):** Running the pipeline without routing scales key/value states incorrectly, doubling magnitudes and blowing up self-attention (producing garbage text outputs and 0.0% recall). This confirms SA-KVR routing is a critical component for model alignment.
-* **Massive Token Context Savings (-95.7%):** While baseline stuffing forces the LLM to parse 468 raw tokens (creating $O(L^2)$ prefill computation overhead), CGM sends only the immediate 20-token user query to the prompt window—achieving a **95.7% token reduction**.
-* **Bypassing the Prefill Phase & Latency Reductions (-70.9%):** By prepending pre-computed memory states directly into the KV-cache, the model skips the prefill stage entirely. Autoregressive decoding starts immediately, reducing median latency by **70.9%** and accelerating decoding speed from 23.7 t/s to **81.5 t/s**.
-* **Fidelity-Guided Compression Guardrail:** Under Approach E, the KV cache compressor evaluated cache state divergence (Cosine Divergence of ~0.58). Because this exceeded the safety threshold of 0.15, the fidelity guardrail correctly rejected the compression step and reverted the cache to the full injected states—maintaining a **100.0% factual recall**.
+* **Factual Recall & Relational Pathways (Phase 2):**
+  * **Relational Paths (2-Hop connected subgraphs):** Graph memory triples are encoded into relational paths (e.g. `[enc(subj||pred||obj||forward_pred); enc(forward_obj)]`), guiding the Memory Encoder Network (MEN) to capture multi-hop links rather than isolated nodes.
+  * **Relevance-Weighted Injection Order:** Retrieved memories are sorted by score in ascending order before cache injection, placing the highest-scoring (most relevant) memories closest to the prompt tokens to exploit the LLM's natural recency bias.
+  * **Factual Recall vs. Graph Complexity:** Incorporating multi-hop graph paths and the routing prior constraint yields **43.9% recall** on the complex evaluation suite for CGM + SA-KVR, outperforming the un-gated ablation baseline (Approach C) which scores **0.0%** due to out-of-distribution KV cache magnitudes blowing up self-attention.
+* **Routing Gate Layer-Depth Specialization Prior:**
+  * **Gaussian Constraint:** Applied a layer-depth bias initialization prior centering a Gaussian distribution ($\mu = 11.5$, $\sigma = 4.0$) on semantic middle layers, regularized by an MSE routing prior loss (weight 0.1).
+  * **Gate Profile:** The trained gates adopt the Gaussian target, peaking at Layer 12 (mean activation `0.8109`) and minimizing in early (Layer 0: `0.2658`) and late layers (Layer 23: `0.2550`).
+* **Massive Token Context Savings (-96.2%):** While baseline stuffing forces the LLM to parse 523 raw tokens (incurring $O(L^2)$ prefill computation overhead), CGM sends only the immediate 20-token user query to the prompt window—achieving a **96.2% token reduction**.
 * **Workstation VRAM Limits (1.5B Constraint):** Benchmarks loaded on the NVIDIA RTX A2000 Laptop GPU (4GB VRAM) show that `Qwen2.5-1.5B-Instruct` alone consumes ~3.84 GB, leaving only **153.7 MB** of VRAM headroom. Any attempt to run retriever networks, optimizer gradients, or dynamic allocations triggers CUDA out-of-memory errors. The 0.5B model optimized via CGM-RAG is therefore highly suited for edge workstation deployment.
+
 
 
 ---

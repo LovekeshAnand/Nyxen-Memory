@@ -62,6 +62,23 @@ class MemoryEncoderNetwork(nn.Module):
                 nn.Linear(128, num_layers * num_heads),
                 nn.Sigmoid()
             )
+            
+            # Apply Layer-Depth Bias Initialization (prior favoring middle layers)
+            import math
+            with torch.no_grad():
+                # Center Gaussian at mid-layer
+                mu = (num_layers - 1) / 2.0
+                sigma = 4.0
+                for l in range(num_layers):
+                    # Calculate prior scaling factor
+                    prior_val = math.exp(-((l - mu) ** 2) / (2 * (sigma ** 2))) # range [0, 1]
+                    # Shift and scale prior_val to map to bias values (e.g. from -1.0 to 1.5)
+                    # This biases the gates to start higher in the middle layers (~0.73 sigmoid)
+                    # and lower in early/late layers (~0.27 sigmoid)
+                    bias_val = -1.0 + 2.5 * prior_val
+                    for h in range(num_heads):
+                        idx = l * num_heads + h
+                        self.routing_gate[2].bias[idx] = bias_val
 
     def forward(self, x: torch.Tensor) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """

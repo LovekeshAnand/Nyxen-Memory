@@ -6,7 +6,7 @@ This document compiles the performance benchmarks of the **Conversational Graph 
 * **Embedding Model:** `all-MiniLM-L6-v2` (384-dim)
 * **Evaluation Trials:** 20 independent runs per approach (with 3 warmup runs)
 * **MEN Training:** KV-Distillation (λ=0.5) + Eval-Recall Early Stopping
-* **Report Generated At:** 2026-06-16 11:52:58
+* **Report Generated At:** 2026-06-16 13:09:36
 
 ---
 
@@ -14,11 +14,25 @@ This document compiles the performance benchmarks of the **Conversational Graph 
 
 | Model | Approach | Input Context Tokens | Virtual Tokens | Median Latency (IQR) | Mean Latency ± Std | Peak GPU VRAM | Decoding Speed | Factual Recall | Degenerate | CGM D vs A Improvement |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Qwen2.5-0.5B-Instruct** | Approach A | 468 | 0 | 1.6878s (1.6614–1.7447s) | 1.6901s ± 0.0905s | 1182.51 MB | 23.7 t/s | 43.2% | 0 |  |
-|  | Approach B | 194 | 0 | 1.5944s (1.3869–1.6565s) | 1.5396s ± 0.1677s | 1149.44 MB | 25.1 t/s | 62.2% | 0 |  |
-|  | Approach C | 20 | 5 (KV) | 1.6286s (1.5615–1.6664s) | 1.6263s ± 0.0669s | 1142.71 MB | 24.6 t/s | 0.0% | 0 |  |
-|  | Approach D | 20 | 5 (KV) | 0.4907s (0.4826–0.5281s) | 0.5093s ± 0.0383s | 1142.16 MB | 81.5 t/s | 100.0% | 0 | **-95.7% context** / **-70.9% latency** |
-|  | Approach E | 20 | 68 (Comp) | 0.6356s (0.6214–0.6549s) | 0.6426s ± 0.0313s | 1142.16 MB | 62.9 t/s | 100.0% | 0 |  |
+| **Qwen2.5-0.5B-Instruct** | Approach A | 523 | 0 | 1.6668s (1.6303–1.6997s) | 1.6506s ± 0.0859s | 1190.24 MB | 24.0 t/s | 61.0% | 0 |  |
+|  | Approach B | 221 | 0 | 1.6545s (1.6132–1.6778s) | 1.6400s ± 0.0556s | 1153.56 MB | 24.2 t/s | 53.7% | 0 |  |
+|  | Approach C | 20 | 6 (KV) | 1.6516s (1.6351–1.6685s) | 1.6557s ± 0.0393s | 1143.20 MB | 24.2 t/s | 0.0% | 0 |  |
+|  | Approach D | 20 | 6 (KV) | 1.6502s (1.6163–1.6704s) | 1.6472s ± 0.0460s | 1143.20 MB | 24.2 t/s | 43.9% | 0 | **-96.2% context** / **-1.0% latency** |
+|  | Approach E | 20 | 100 (Comp) | 1.8723s (1.8568–1.8915s) | 1.8806s ± 0.0428s | 1143.20 MB | 21.4 t/s | 43.9% | 0 |  |
+
+---
+
+## 🧠 Generalization and Reasoning Stress Test Suite
+
+Evaluating the system's capacity to generalize to unseen phrasings, execute multi-hop compositional reasoning over relational chains, and resist context distraction.
+
+| Model | Approach | Generalization Rate | Degenerate Count |
+| :--- | :--- | :---: | :---: |
+| **Qwen2.5-0.5B-Instruct** | Approach A | 50.0% | 0 |
+|  | Approach B | 75.0% | 0 |
+|  | Approach C | 0.0% | 0 |
+|  | Approach D | 0.0% | 0 |
+|  | Approach E | 0.0% | 0 |
 
 ---
 
@@ -27,8 +41,8 @@ This document compiles the performance benchmarks of the **Conversational Graph 
 Evaluating whether the routing network makes active gating decisions or acts as a no-op:
 
 ### 🔍 Qwen2.5-0.5B-Instruct Routing Stats
-* **Global Mean Gate Value:** 0.4934 (std: 0.0248)
-* **Gate Range:** [0.4325, 0.5832]
+* **Global Mean Gate Value:** 0.5040 (std: 0.1962)
+* **Gate Range:** [0.2402, 0.8313]
 * **Gate Activation Sparsity:**
   - **Near-Zero (Inactive, <0.1):** 0.0%
   - **Mid-Range (0.1–0.9):** 100.0%
@@ -37,30 +51,30 @@ Evaluating whether the routing network makes active gating decisions or acts as 
 #### Per-Layer Activation Summary
 | Layer | Mean Gate Value | Std Dev | Inactive (<0.1) | Active (>0.9) |
 | :---: | :---: | :---: | :---: | :---: |
-| Layer 0 | 0.4846 | 0.0101 | 0.0% | 0.0% |
-| Layer 1 | 0.4785 | 0.0067 | 0.0% | 0.0% |
-| Layer 2 | 0.4861 | 0.0137 | 0.0% | 0.0% |
-| Layer 3 | 0.4808 | 0.0157 | 0.0% | 0.0% |
-| Layer 4 | 0.4765 | 0.0085 | 0.0% | 0.0% |
-| Layer 5 | 0.4726 | 0.0063 | 0.0% | 0.0% |
-| Layer 6 | 0.4837 | 0.0365 | 0.0% | 0.0% |
-| Layer 7 | 0.4904 | 0.0140 | 0.0% | 0.0% |
-| Layer 8 | 0.4867 | 0.0063 | 0.0% | 0.0% |
-| Layer 9 | 0.4712 | 0.0081 | 0.0% | 0.0% |
-| Layer 10 | 0.4878 | 0.0261 | 0.0% | 0.0% |
-| Layer 11 | 0.4856 | 0.0124 | 0.0% | 0.0% |
-| Layer 12 | 0.4982 | 0.0191 | 0.0% | 0.0% |
-| Layer 13 | 0.4878 | 0.0065 | 0.0% | 0.0% |
-| Layer 14 | 0.4886 | 0.0111 | 0.0% | 0.0% |
-| Layer 15 | 0.5123 | 0.0153 | 0.0% | 0.0% |
-| Layer 16 | 0.4657 | 0.0079 | 0.0% | 0.0% |
-| Layer 17 | 0.4924 | 0.0144 | 0.0% | 0.0% |
-| Layer 18 | 0.5078 | 0.0207 | 0.0% | 0.0% |
-| Layer 19 | 0.5307 | 0.0089 | 0.0% | 0.0% |
-| Layer 20 | 0.5175 | 0.0287 | 0.0% | 0.0% |
-| Layer 21 | 0.5214 | 0.0223 | 0.0% | 0.0% |
-| Layer 22 | 0.4955 | 0.0146 | 0.0% | 0.0% |
-| Layer 23 | 0.5384 | 0.0183 | 0.0% | 0.0% |
+| Layer 0 | 0.2658 | 0.0046 | 0.0% | 0.0% |
+| Layer 1 | 0.2773 | 0.0070 | 0.0% | 0.0% |
+| Layer 2 | 0.2973 | 0.0035 | 0.0% | 0.0% |
+| Layer 3 | 0.3312 | 0.0086 | 0.0% | 0.0% |
+| Layer 4 | 0.3650 | 0.0118 | 0.0% | 0.0% |
+| Layer 5 | 0.4081 | 0.0075 | 0.0% | 0.0% |
+| Layer 6 | 0.4984 | 0.0111 | 0.0% | 0.0% |
+| Layer 7 | 0.5702 | 0.0045 | 0.0% | 0.0% |
+| Layer 8 | 0.6729 | 0.0107 | 0.0% | 0.0% |
+| Layer 9 | 0.7330 | 0.0074 | 0.0% | 0.0% |
+| Layer 10 | 0.7898 | 0.0054 | 0.0% | 0.0% |
+| Layer 11 | 0.8093 | 0.0064 | 0.0% | 0.0% |
+| Layer 12 | 0.8109 | 0.0065 | 0.0% | 0.0% |
+| Layer 13 | 0.7870 | 0.0048 | 0.0% | 0.0% |
+| Layer 14 | 0.7361 | 0.0103 | 0.0% | 0.0% |
+| Layer 15 | 0.6702 | 0.0060 | 0.0% | 0.0% |
+| Layer 16 | 0.5639 | 0.0203 | 0.0% | 0.0% |
+| Layer 17 | 0.5104 | 0.0106 | 0.0% | 0.0% |
+| Layer 18 | 0.4242 | 0.0165 | 0.0% | 0.0% |
+| Layer 19 | 0.3691 | 0.0100 | 0.0% | 0.0% |
+| Layer 20 | 0.3305 | 0.0199 | 0.0% | 0.0% |
+| Layer 21 | 0.3298 | 0.0068 | 0.0% | 0.0% |
+| Layer 22 | 0.2914 | 0.0185 | 0.0% | 0.0% |
+| Layer 23 | 0.2550 | 0.0081 | 0.0% | 0.0% |
 
 
 
@@ -71,12 +85,12 @@ Evaluating whether the routing network makes active gating decisions or acts as 
 Characterizing the fidelity-vs-memory tradeoff:
 
 ### 💾 Qwen2.5-0.5B-Instruct Cache Compression
-* **Pre-Compression Sequence Length:** 80 tokens
-* **Post-Compression Sequence Length:** 80 tokens
+* **Pre-Compression Sequence Length:** 82 tokens
+* **Post-Compression Sequence Length:** 82 tokens
 * **Cache Savings:** 0 tokens (0.0% memory reduction)
-* **Fidelity Gate Score (Cosine Similarity Divergence):** 0.7254 (Threshold: 0.15)
+* **Fidelity Gate Score (Cosine Similarity Divergence):** 0.7582 (Threshold: 0.15)
 * **Status:** **REJECTED/REVERTED**
-* **Fidelity/Recall Tradeoff Impact:** 0.0% (No loss) (Recall D: 100.0% vs Recall E: 100.0%)
+* **Fidelity/Recall Tradeoff Impact:** 0.0% (No loss) (Recall D: 43.9% vs Recall E: 43.9%)
 
 
 
