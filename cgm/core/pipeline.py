@@ -24,11 +24,19 @@ class CGMPipeline:
     Loads the target LLM (locally via PyTorch or calls local Ollama endpoints),
     retrieves relevant subgraph memory, projects it to KV space, and runs inference.
     """
-    def __init__(self, model_name: str = "gpt2", db_path: str = "data/cgm_memory.db", device: str = None, rank: int = 64):
+    def __init__(
+        self,
+        model_name: str = "gpt2",
+        db_path: str = "data/cgm_memory.db",
+        device: str = None,
+        rank: int = 64,
+        men_checkpoint: str = "data/checkpoints/men_state_dict.pt",
+    ):
         self.db_path = db_path
         self.model_name = model_name
         self.device = device
         self.rank = rank
+        self.men_checkpoint = men_checkpoint
         
         # Initialize GPU guards
         self.mem_guard = GPUMemoryGuard()
@@ -50,6 +58,34 @@ class CGMPipeline:
         self.active_cache = None
         # MEN output cache: maps md5(input_tensor_bytes) -> List[(K, V)] for memoization
         self._men_cache: Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
+
+    def _load_men_checkpoint(self, verbose: bool = True) -> None:
+        """Load trained MEN weights if a compatible checkpoint exists."""
+        if not self.men_checkpoint:
+            return
+        if not torch.cuda.is_available() and self.device is None:
+            map_location = "cpu"
+        else:
+            map_location = self.device or "cpu"
+        try:
+            checkpoint = torch.load(self.men_checkpoint, map_location=map_location)
+        except FileNotFoundError:
+            if verbose:
+                print(f"[Pipeline] No MEN checkpoint found at {self.men_checkpoint}; using random init.")
+            return
+        except Exception as exc:
+            if verbose:
+                print(f"[Pipeline] Warning: Could not load MEN checkpoint: {exc}")
+            return
+
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        try:
+            self._men.load_state_dict(state_dict)
+            if verbose:
+                print(f"[Pipeline] Loaded trained MEN weights from {self.men_checkpoint}.")
+        except Exception as exc:
+            if verbose:
+                print(f"[Pipeline] Warning: MEN checkpoint incompatible: {exc}")
 
     def initialize(self, verbose: bool = True):
         """
@@ -136,6 +172,7 @@ class CGMPipeline:
                 self._men = MemoryEncoderNetwork(input_dim=768, num_layers=num_layers, num_heads=num_heads, head_dim=head_dim, use_routing=True, rank=self.rank)
                 self._men.to(self.device)
                 self._men.eval()
+                self._load_men_checkpoint(verbose=verbose)
 
         # Log pipeline initialize event
         try:
@@ -173,10 +210,23 @@ class CGMPipeline:
         if self._retriever is None: self.initialize()
         return self._retriever
 
-    def generate(self, conversation_id: str, query_text: str, k: int = 15, max_new_tokens: int = 100, mode: str = "inject", do_sample: bool = True) -> str:
+    def generate(
+        self,
+        conversation_id: str,
+        query_text: str,
+        k: int = 15,
+        max_new_tokens: int = 100,
+        mode: str = "inject",
+        do_sample: bool = True,
+        tenant_id: str = "default_tenant",
+        user_id: str = "default_user",
+        max_injected_triples: int = 20,
+        persist_response: bool = True,
+    ) -> str:
         """
         Runs pipeline: retrieves memories -> projects memory -> injects KVs -> generates response.
         Fully protected by VRAM guards, thread locks, and input bounds checking.
+        Supports multi-scope memory banks, temporal/negation queries, and abstention gate.
         """
         # 1. Sanitize input text and check buffer limits
         query_clean = InputBufferGuard.sanitize_string(query_text)
@@ -185,10 +235,32 @@ class CGMPipeline:
         if not self.use_ollama:
             self.mem_guard.enforce_safety()
         
-        # 3. Retrieve relevant memories
-        print(f"[Pipeline] Querying memory store for conversation '{conversation_id}'...")
-        memories = self.retriever.retrieve(conversation_id, query_clean, k=k)
+        # 3. Retrieve relevant memories across multi-scopes (Session, User, Tenant)
+        print(f"[Pipeline] Querying multi-scope memory stores (Session: '{conversation_id}', User: 'user_{user_id}', Tenant: 'tenant_{tenant_id}')...")
         
+        # Budget allocations — session scope gets full k unless multi-scope stores exist
+        k_session = k
+        k_user = 0
+        k_tenant = 0
+        if tenant_id != "default_tenant" or user_id != "default_user":
+            k_session = max(1, k - 6)
+            k_user = 3
+            k_tenant = 3
+
+        session_mems = self.retriever.retrieve(conversation_id, query_clean, k=k_session, tenant_id=tenant_id, user_id=user_id)
+        user_mems = self.retriever.retrieve(f"user_{user_id}", query_clean, k=k_user, tenant_id=tenant_id, user_id=user_id) if k_user else []
+        tenant_mems = self.retriever.retrieve(f"tenant_{tenant_id}", query_clean, k=k_tenant, tenant_id=tenant_id, user_id=user_id) if k_tenant else []
+
+        # Combine memories
+        memories = session_mems + user_mems + tenant_mems
+        
+        # 3b. Abstention Check: If the highest similarity score is below threshold, return non-committal response directly.
+        threshold = 0.01
+        max_score = max([m.score for m in memories]) if memories else 0.0
+        if not memories or max_score < threshold:
+            print(f"[Pipeline] Abstention active: max memory similarity score {max_score:.4f} < {threshold}. Bypassing generation and returning abstention.")
+            return "I do not have information about that in my memory."
+            
         # 4. If memory exists and mode is 'inject', project it to KV cache using MEN (only for PyTorch)
         past_key_values = None
         memory_length = 0  # Track how many memory tokens are injected
@@ -200,7 +272,7 @@ class CGMPipeline:
             
         if mode == "inject" and memories:
             # Sort retrieved memories by score in ascending order so that the highest score (most relevant)
-            # sits at the end of the sequence, closest to prompt tokens (leveraging natural attention recency bias).
+            # sits at the end of the sequence, closest to prompt tokens.
             sorted_memories = sorted(memories, key=lambda m: getattr(m, "score", getattr(m, "similarity_score", 0.0)))
             print(f"[Pipeline] Extracted {len(sorted_memories)} relevant turns. Encoding memory triples...")
             try:
@@ -213,26 +285,44 @@ class CGMPipeline:
             
             from cgm.training.train_data import encode_triple
             
+            # Check for negation terms in user query
+            contains_negation = any(w in query_clean.lower() for w in ["not", "never", "no longer", "decided against", "changed from", "instead of", "delete", "remove", "incorrect"])
+            
             # Fetch triples from the graph store for each retrieved turn and encode properly
             x_list = []
             with self.store._lock:
                 conn = self.store._get_connection()
                 cursor = conn.cursor()
                 
-                # Fetch all triples for this conversation to build paths
-                cursor.execute("""
-                    SELECT subject, predicate, object FROM triples
-                    WHERE conversation_id = ?
-                """, (conversation_id,))
-                all_conversation_triples = [[row["subject"], row["predicate"], row["object"]] for row in cursor.fetchall()]
+                # Fetch all active triples across all matched scopes to build paths
+                all_conversation_triples = []
+                scopes_queried = set(m.conversation_id for m in sorted_memories)
+                for scope_id in scopes_queried:
+                    if contains_negation:
+                        cursor.execute("""
+                            SELECT subject, predicate, object FROM triples
+                            WHERE conversation_id = ? AND tenant_id = ? AND user_id = ? AND valid_until IS NULL
+                        """, (scope_id, tenant_id, user_id))
+                    else:
+                        cursor.execute("""
+                            SELECT subject, predicate, object FROM triples
+                            WHERE conversation_id = ? AND tenant_id = ? AND user_id = ? AND valid_until IS NULL AND is_negated = 0
+                        """, (scope_id, tenant_id, user_id))
+                    all_conversation_triples.extend([[row["subject"], row["predicate"], row["object"]] for row in cursor.fetchall()])
                 
-                # 1. Gather primary triples from retrieved turns
+                # Gather primary triples from retrieved turns
                 primary_triples = []
                 for mem in sorted_memories:
-                    cursor.execute("""
-                        SELECT subject, predicate, object FROM triples
-                        WHERE conversation_id = ? AND turn_id = ?
-                    """, (conversation_id, mem.turn_id))
+                    if contains_negation:
+                        cursor.execute("""
+                            SELECT subject, predicate, object FROM triples
+                            WHERE conversation_id = ? AND turn_id = ? AND tenant_id = ? AND user_id = ? AND valid_until IS NULL
+                        """, (mem.conversation_id, mem.turn_id, tenant_id, user_id))
+                    else:
+                        cursor.execute("""
+                            SELECT subject, predicate, object FROM triples
+                            WHERE conversation_id = ? AND turn_id = ? AND tenant_id = ? AND user_id = ? AND valid_until IS NULL AND is_negated = 0
+                        """, (mem.conversation_id, mem.turn_id, tenant_id, user_id))
                     triple_rows = cursor.fetchall()
                     for row in triple_rows:
                         primary_triples.append([row["subject"], row["predicate"], row["object"]])
@@ -247,13 +337,13 @@ class CGMPipeline:
                             seen_triples.add(t_tuple)
                             unique_triples.append(trip)
                     
-                    # 2. Extract entities to find 1-hop neighbors
+                    # Extract entities to find 1-hop neighbors
                     entities = set()
                     for trip in unique_triples:
                         entities.add(trip[0].lower().strip())
                         entities.add(trip[2].lower().strip())
                     
-                    # 3. Fetch neighbors from all_conversation_triples
+                    # Fetch neighbors from all_conversation_triples
                     for trip in all_conversation_triples:
                         t_tuple = (trip[0].lower().strip(), trip[1].lower().strip(), trip[2].lower().strip())
                         if t_tuple not in seen_triples:
@@ -263,7 +353,39 @@ class CGMPipeline:
                                 seen_triples.add(t_tuple)
                                 unique_triples.append(trip)
                     
-                    # 4. Encode each of the gathered triples with proper structure
+                    # Rerank triples with Cross-Encoder to prioritize the most relevant triples for MEN
+                    if unique_triples:
+                        try:
+                            triple_texts = [f"{t[0]} {t[1]} {t[2]}" for t in unique_triples]
+                            pairs = [(query_clean, t_txt) for t_txt in triple_texts]
+                            with GPULockManager():
+                                ce_scores = self.retriever.cross_encoder.predict(pairs)
+                            scored_triples = list(zip(unique_triples, ce_scores))
+                            query_lower = query_clean.lower()
+                            temporal_query = any(token in query_lower for token in ("when", "date", "day", "month", "year"))
+                            if temporal_query:
+                                temporal_bonus_patterns = (
+                                    "date", "year", "month", "day", "time", "yesterday", "today", "last", "before", "after",
+                                )
+                                boosted = []
+                                for triple, score in scored_triples:
+                                    triple_text = " ".join(str(part).lower() for part in triple)
+                                    bonus = 0.0
+                                    if any(pattern in triple_text for pattern in temporal_bonus_patterns):
+                                        bonus += 0.25
+                                    if any(ch.isdigit() for ch in triple_text):
+                                        bonus += 0.15
+                                    boosted.append((triple, score + bonus))
+                                scored_triples = boosted
+                            # Ascending: lowest CE first, highest (most relevant) at END closest to prompt
+                            scored_triples = sorted(scored_triples, key=lambda x: x[1])
+                            unique_triples = [t for t, _ in scored_triples]
+                            if len(unique_triples) > max_injected_triples:
+                                unique_triples = unique_triples[-max_injected_triples:]
+                        except Exception as e:
+                            print(f"[Pipeline] Warning: Triple reranking failed: {e}")
+                    
+                    # Encode each of the gathered triples with proper structure
                     for triple in unique_triples:
                         x_i = encode_triple(triple, self.retriever.embed_text, all_triples=all_conversation_triples)
                         x_list.append(x_i)
@@ -334,6 +456,8 @@ class CGMPipeline:
                 print(f"[Pipeline] Memory KV cache injected: {memory_length} triple positions across {len(raw_kv_tuples)} layers.")
 
         # 5. Build prompt
+        from cgm.eval.prompts import SYSTEM_PREFIX
+        system_prefix = SYSTEM_PREFIX
         if mode == "text" and memories:
             # Sort retrieved memories chronologically to maintain temporal history context
             sorted_memories = sorted(memories, key=lambda m: m.turn_id)
@@ -346,9 +470,9 @@ class CGMPipeline:
                 else:
                     summary_parts.append(f"Turn {mem.turn_id} - User: {user_msg}")
             summary_context = "\n".join(summary_parts)
-            prompt = f"Distilled Past Conversation History:\n{summary_context}\n\nUser: {query_clean}\nAssistant:"
+            prompt = f"{system_prefix}Distilled Past Conversation History:\n{summary_context}\n\nUser: {query_clean}\nAssistant:"
         else:
-            prompt = f"User: {query_clean}\nAssistant:"
+            prompt = f"{system_prefix}User: {query_clean}\nAssistant:"
             
         # 6. Run generation
         if self.use_ollama:
@@ -450,29 +574,33 @@ class CGMPipeline:
                 if stop_word in response:
                     response = response.split(stop_word)[0].strip()
                 
-        # 8. Store the newly generated turn (user query + assistant response) to retriever memory
-        try:
-            with self.store._lock:
-                conn = self.store._get_connection()
-                cursor = conn.cursor()
-                cursor.execute("SELECT MAX(turn_id) FROM turns WHERE conversation_id = ?", (conversation_id,))
-                row = cursor.fetchone()
-                max_tid = row[0] if (row is not None and row[0] is not None) else 0
-                conn.close()
-            new_turn_id = max_tid + 1
-            
-            turn_text = f"{query_clean} {response}"
-            self.retriever.store_turn(
-                conversation_id=conversation_id,
-                turn_id=new_turn_id,
-                text=turn_text,
-                summary=f"User: '{query_clean[:100]}...' | Assistant: '{response[:100]}...'",
-                user_text=query_clean,
-                assistant_text=response
-            )
-            print(f"[Pipeline] Successfully stored new turn {new_turn_id} to memory.")
-        except Exception as e:
-            print(f"[Pipeline] Error saving turn to store: {e}")
+        # 8. Store the newly generated turn for interactive use. Benchmarks disable
+        # this so generated answers do not contaminate the retrieval index.
+        if persist_response:
+            try:
+                with self.store._lock:
+                    conn = self.store._get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT MAX(turn_id) FROM turns WHERE conversation_id = ? AND tenant_id = ? AND user_id = ?", (conversation_id, tenant_id, user_id))
+                    row = cursor.fetchone()
+                    max_tid = row[0] if (row is not None and row[0] is not None) else 0
+                    conn.close()
+                new_turn_id = max_tid + 1
+                
+                turn_text = f"{query_clean} {response}"
+                self.retriever.store_turn(
+                    conversation_id=conversation_id,
+                    turn_id=new_turn_id,
+                    text=turn_text,
+                    summary=f"User: '{query_clean[:100]}...' | Assistant: '{response[:100]}...'",
+                    user_text=query_clean,
+                    assistant_text=response,
+                    tenant_id=tenant_id,
+                    user_id=user_id
+                )
+                print(f"[Pipeline] Successfully stored new turn {new_turn_id} to memory.")
+            except Exception as e:
+                print(f"[Pipeline] Error saving turn to store: {e}")
             
         # 9. Trigger background compressor if VRAM is low (only for PyTorch local model)
         if not self.use_ollama:

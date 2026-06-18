@@ -1,16 +1,14 @@
 import os
 import sys
 import json
-import sqlite3
 import time
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import cgm
 from cgm.core.pipeline import CGMPipeline
+from cgm.eval.prompts import wrap_training_prompt, SYSTEM_PREFIX
+from cgm.eval.locomo_score import score_qa_item, aggregate_results
 from cgm.training.train import MEGATrainer
 from cgm.training.train_data import TripleTrainingSample, encode_triple, split_train_eval
 
@@ -119,7 +117,9 @@ def map_qa_to_samples(pipeline, graph_data, conversation_id="locomo_conv_0"):
             continue
             
         # Get candidate triples in this session
-        candidates = triple_by_session.get(evidence_session, [])
+        candidates = []
+        for session_candidate in (evidence_session, evidence_session + 1, evidence_session - 1):
+            candidates.extend(triple_by_session.get(session_candidate, []))
         if not candidates:
             # Fallback to all triples if session-specific list is empty
             candidates = all_triples
@@ -134,11 +134,19 @@ def map_qa_to_samples(pipeline, graph_data, conversation_id="locomo_conv_0"):
         q_emb = q_embeddings[idx]
         best_sim = -1.0
         best_triple = candidates[0]
+        query_lower = qa["question"].lower()
+        temporal_query = any(token in query_lower for token in ("when", "date", "day", "month", "year"))
         
         for cand_idx, cand_triple in enumerate(candidates):
             cand_text = candidate_texts[cand_idx]
             cand_emb = pipeline.retriever.embed_text(cand_text)
             sim = np.dot(q_emb, cand_emb) / (np.linalg.norm(q_emb) * np.linalg.norm(cand_emb) + 1e-8)
+            if temporal_query:
+                triple_text = " ".join(str(part).lower() for part in cand_triple)
+                if any(token in triple_text for token in ("date", "year", "month", "day", "time", "yesterday", "today", "last", "before", "after")):
+                    sim += 0.25
+                if any(ch.isdigit() for ch in triple_text):
+                    sim += 0.15
             if sim > best_sim:
                 best_sim = sim
                 best_triple = cand_triple
@@ -147,15 +155,16 @@ def map_qa_to_samples(pipeline, graph_data, conversation_id="locomo_conv_0"):
         ans_val = qa.get("answer") or qa.get("adversarial_answer")
         if not ans_val:
             continue
-        target = f"The answer to '{qa['question']}' is {ans_val}."
+        target = str(ans_val).strip()
         
         # Encode triple representation
         x_vec = encode_triple(best_triple, pipeline.retriever.embed_text, all_triples=all_triples)
         
+        system_prefix = SYSTEM_PREFIX
         samples.append(TripleTrainingSample(
             triple=best_triple,
             x_vector=x_vec,
-            prompt_text=f"User: {qa['question']}\nAssistant:",
+            prompt_text=wrap_training_prompt(f"User: {qa['question']}\nAssistant:", system_prefix),
             target_text=target,
             triple_text=f"{best_triple[0]} {best_triple[1]} {best_triple[2]}"
         ))
@@ -238,7 +247,14 @@ def evaluate_recall_for_approach(pipeline, eval_samples, mode="stuffing", conver
             total_tokens += tokens # Just prompt tokens, rest are virtual
             
             # Call pipeline generate with inject mode
-            response = pipeline.generate(conversation_id, query_text, k=15, max_new_tokens=40, mode="inject")
+            response = pipeline.generate(
+                conversation_id,
+                query_text,
+                k=15,
+                max_new_tokens=40,
+                mode="inject",
+                persist_response=False,
+            )
             
         # Check correctness (semantic overlap of keyword answer in the response)
         target_words = sample.target_text.split("is ")[-1].replace(".", "").strip().lower().split()
@@ -265,9 +281,18 @@ def evaluate_recall_for_approach(pipeline, eval_samples, mode="stuffing", conver
     recall = 100 * correct / total
     avg_tokens = total_tokens / total
     
-    print(f"[{mode.upper()} Finished] Recall: {recall:.1f}%, Avg Input Tokens: {avg_tokens:.1f}, Avg Latency: {latency:.3f}s")
+    # Calculate 95% Confidence Interval
+    p_hat = correct / total
+    se = np.sqrt(p_hat * (1.0 - p_hat) / total) if total > 0 else 0.0
+    moe = 1.96 * se * 100
+    ci_lower = max(0.0, recall - moe)
+    ci_upper = min(100.0, recall + moe)
+    
+    print(f"[{mode.upper()} Finished] Recall: {recall:.1f}% (95% CI: [{ci_lower:.1f}%, {ci_upper:.1f}%]), Avg Input Tokens: {avg_tokens:.1f}, Avg Latency: {latency:.3f}s")
     return {
         "recall": recall,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
         "avg_tokens": avg_tokens,
         "latency": latency
     }
@@ -312,7 +337,7 @@ def main():
     
     # 5. Train MEN Adapter
     print(f"\n[Trainer] Training Memory Encoder Network (rank={args.rank}) on LoCoMo training set...")
-    trainer = MEGATrainer(pipeline, lr=5e-4, distill_lambda=0.05)
+    trainer = MEGATrainer(pipeline, lr=5e-4, distill_lambda=0.5)
     trainer.mem_guard.enforce_safety = lambda *args, **kwargs: None
     
     # Train
@@ -325,8 +350,8 @@ def main():
     )
     
     # 6. Evaluate all three approaches
-    # We evaluate on a subset of 30 items to verify recall under constraints quickly
-    eval_subset = eval_samples[:30]
+    # Evaluate all eval samples (no 30-Q cap). For full 1540-Q suite use run_locomo_benchmark.py
+    eval_subset = eval_samples
     
     results = {}
     results["stuffing"] = evaluate_recall_for_approach(pipeline, eval_subset, mode="stuffing", conversation_id=conversation_id)

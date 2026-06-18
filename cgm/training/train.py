@@ -1,4 +1,5 @@
 import time
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +15,7 @@ from cgm.safety.safety import GPULockManager, GPUMemoryGuard, ThermalGuard
 from cgm.training.train_data import (
     TripleTrainingSample, encode_triple, build_training_samples, split_train_eval
 )
+from cgm.eval.prompts import wrap_training_prompt
 
 
 class MEGATrainer:
@@ -33,6 +35,21 @@ class MEGATrainer:
         self.distill_lambda = distill_lambda
         self.thermal_guard = ThermalGuard(target_temp_c=75.0, max_temp_c=85.0)
         self.mem_guard = GPUMemoryGuard()
+        self.default_checkpoint_path = "data/checkpoints/men_state_dict.pt"
+
+    def _save_men_checkpoint(self, path: str = None) -> None:
+        """Persist trained MEN weights so inference can load the same architecture."""
+        checkpoint_path = path or self.default_checkpoint_path
+        os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+        torch.save({
+            "state_dict": self.pipeline.men.state_dict(),
+            "model_name": self.pipeline.model_name,
+            "rank": self.pipeline.rank,
+            "num_layers": self.pipeline.men.num_layers,
+            "num_heads": self.pipeline.men.num_heads,
+            "head_dim": self.pipeline.men.head_dim,
+            "use_routing": self.pipeline.men.use_routing,
+        }, checkpoint_path)
 
     def _build_men_cache(self, x_triples: torch.Tensor) -> Tuple[DynamicCache, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Runs MEN forward and wraps output into a DynamicCache with position-appropriate RoPE rotation."""
@@ -303,7 +320,9 @@ class MEGATrainer:
                         
                     past_kv.update(k_cast, v_cast, idx)
                 
-                prompt_ids = self.pipeline.tokenizer(sample.prompt_text, return_tensors="pt").input_ids.to(self.pipeline.device)
+                prompt_ids = self.pipeline.tokenizer(
+                    wrap_training_prompt(sample.prompt_text), return_tensors="pt"
+                ).input_ids.to(self.pipeline.device)
                 
                 memory_length = x_all_tensor.shape[1]
                 memory_mask = torch.ones(1, memory_length, dtype=torch.long, device=self.pipeline.device)
@@ -353,6 +372,9 @@ class MEGATrainer:
         epochs: int = 200,
         patience: int = 15,
         lr: float = None,
+        retrieval_aware: bool = True,
+        max_cache_triples: int = 20,
+        num_distractors: int = 15,
     ) -> Dict[str, Any]:
         """
         Full training loop with KV-distillation, multi-triple data, and eval-recall early stopping.
@@ -379,6 +401,7 @@ class MEGATrainer:
         print(f"  Patience      : {patience}")
         print(f"  Distill λ     : {self.distill_lambda}")
         print(f"  Learning rate : {lr}")
+        print(f"  Retrieval-aware: {retrieval_aware} (max_cache={max_cache_triples})")
         
         # Freeze LLM, unfreeze MEN
         for param in self.pipeline.model.parameters():
@@ -415,14 +438,16 @@ class MEGATrainer:
                     triple_idx = idx
                     break
             
-            prompt_ids = self.pipeline.tokenizer(sample.prompt_text, return_tensors="pt").input_ids.to(self.pipeline.device)
+            prompt_ids = self.pipeline.tokenizer(
+                wrap_training_prompt(sample.prompt_text), return_tensors="pt"
+            ).input_ids.to(self.pipeline.device)
             target_ids = self.pipeline.tokenizer(sample.target_text, return_tensors="pt").input_ids.to(self.pipeline.device)
             
             teacher_kv = None
             if self.distill_lambda > 0 and sample.triple_text is not None:
                 teacher_kv = self._extract_teacher_kv(sample.triple_text)
                 
-            tokenized_samples.append((prompt_ids, target_ids, sample.triple_text, triple_idx, teacher_kv))
+            tokenized_samples.append((prompt_ids, target_ids, sample.triple_text, triple_idx, teacher_kv, sample.triple))
         
         # Dynamic Magnitude Calibration
         print("  Running dynamic magnitude calibration...")
@@ -500,14 +525,7 @@ class MEGATrainer:
                 attn_dtype = next(self.pipeline.model.parameters()).dtype
                 
             memory_length = x_all_tensor.shape[1]
-            if hasattr(self.pipeline.model.model, "rotary_emb"):
-                pos_ids = torch.arange(memory_length, dtype=torch.long, device=self.pipeline.device).unsqueeze(0)
-                dummy_x = torch.zeros(1, 1, memory_length, self.pipeline.model.config.hidden_size // self.pipeline.model.config.num_attention_heads).to(self.pipeline.device)
-                cos, sin = self.pipeline.model.model.rotary_emb(dummy_x, pos_ids)
-                cos_u = cos.unsqueeze(1).to(dtype=attn_dtype)
-                sin_u = sin.unsqueeze(1).to(dtype=attn_dtype)
-            else:
-                cos_u, sin_u = None, None
+            has_rotary = hasattr(self.pipeline.model.model, "rotary_emb")
                 
             # 4. Accumulate gradients over all samples
             epoch_losses = {"total": [], "gen": [], "distill": []}
@@ -522,29 +540,53 @@ class MEGATrainer:
             
             with GPULockManager():
                 for sample_idx in order:
-                    prompt_ids, target_ids, triple_text, triple_idx, teacher_kv = tokenized_samples[sample_idx]
-                    
-                    # Build fresh sample cache with RoPE applied for this sample to avoid autograd graph reuse errors
+                    prompt_ids, target_ids, triple_text, triple_idx, teacher_kv, target_triple = tokenized_samples[sample_idx]
+
+                    # Build per-sample cache: retrieval-aware subset with target triple at end
+                    if retrieval_aware and triple_idx >= 0 and len(unique_triples) > 1:
+                        other_indices = [i for i in range(len(unique_triples)) if i != triple_idx]
+                        np.random.shuffle(other_indices)
+                        distractor_indices = other_indices[:num_distractors]
+                        cache_indices = distractor_indices + [triple_idx]
+                        if len(cache_indices) > max_cache_triples:
+                            cache_indices = cache_indices[-max_cache_triples:]
+                        sample_memory_length = len(cache_indices)
+                    else:
+                        cache_indices = list(range(memory_length))
+                        sample_memory_length = memory_length
+
                     sample_cache = DynamicCache()
                     for idx in range(len(accum_k_list)):
-                        k_cast = accum_k_list[idx].to(dtype=attn_dtype)
-                        v_cast = accum_v_list[idx].to(dtype=attn_dtype)
-                        if cos_u is not None:
+                        k_subset = accum_k_list[idx][:, :, cache_indices, :]
+                        v_subset = accum_v_list[idx][:, :, cache_indices, :]
+                        k_cast = k_subset.to(dtype=attn_dtype)
+                        v_cast = v_subset.to(dtype=attn_dtype)
+                        if has_rotary:
+                            pos_ids = torch.arange(sample_memory_length, dtype=torch.long, device=self.pipeline.device).unsqueeze(0)
+                            dummy_x = torch.zeros(
+                                1,
+                                1,
+                                sample_memory_length,
+                                self.pipeline.model.config.hidden_size // self.pipeline.model.config.num_attention_heads,
+                            ).to(self.pipeline.device)
+                            cos, sin = self.pipeline.model.model.rotary_emb(dummy_x, pos_ids)
+                            sub_cos = cos.unsqueeze(1).to(dtype=attn_dtype)
+                            sub_sin = sin.unsqueeze(1).to(dtype=attn_dtype)
                             k1 = k_cast[..., : k_cast.shape[-1] // 2]
                             k2 = k_cast[..., k_cast.shape[-1] // 2 :]
                             rot_k = torch.cat((-k2, k1), dim=-1)
-                            k_cast = (k_cast * cos_u) + (rot_k * sin_u)
+                            k_cast = (k_cast * sub_cos) + (rot_k * sub_sin)
                         sample_cache.update(k_cast, v_cast, idx)
-                        
+
                     # Prepare inputs
                     inputs = torch.cat([prompt_ids, target_ids], dim=-1).to(self.pipeline.device)
-                    memory_mask = torch.ones(inputs.shape[0], memory_length, dtype=torch.long, device=self.pipeline.device)
+                    memory_mask = torch.ones(inputs.shape[0], sample_memory_length, dtype=torch.long, device=self.pipeline.device)
                     inputs_mask = torch.ones_like(inputs)
                     attention_mask = torch.cat([memory_mask, inputs_mask], dim=-1)
                     
                     position_ids = torch.arange(
-                        memory_length, 
-                        memory_length + inputs.shape[-1], 
+                        sample_memory_length, 
+                        sample_memory_length + inputs.shape[-1], 
                         dtype=torch.long, 
                         device=self.pipeline.device
                     ).unsqueeze(0).expand(inputs.shape[0], -1)
@@ -570,15 +612,17 @@ class MEGATrainer:
                     )
                     
                     loss_distill = torch.tensor(0.0, device=self.pipeline.device)
-                    if self.distill_lambda > 0 and teacher_kv is not None:
-                        # Slice the active triple's KVs from accum_k_list / accum_v_list
-                        sliced_men_kv = []
-                        for k_leaf, v_leaf in zip(accum_k_list, accum_v_list):
-                            sliced_men_kv.append((
-                                k_leaf[:, :, triple_idx:triple_idx+1, :],
-                                v_leaf[:, :, triple_idx:triple_idx+1, :]
-                            ))
-                        loss_distill = self._compute_distillation_loss(sliced_men_kv, teacher_kv)
+                    if self.distill_lambda > 0 and teacher_kv is not None and triple_idx >= 0:
+                        # Distill the target triple at its position in the sample cache
+                        target_pos = cache_indices.index(triple_idx) if triple_idx in cache_indices else -1
+                        if target_pos >= 0:
+                            sliced_men_kv = []
+                            for k_leaf, v_leaf in zip(accum_k_list, accum_v_list):
+                                sliced_men_kv.append((
+                                    k_leaf[:, :, triple_idx:triple_idx+1, :],
+                                    v_leaf[:, :, triple_idx:triple_idx+1, :]
+                                ))
+                            loss_distill = self._compute_distillation_loss(sliced_men_kv, teacher_kv)
                         
                     loss_total = loss_gen + self.distill_lambda * loss_distill
                     loss_sample = loss_total / len(tokenized_samples)
@@ -671,14 +715,15 @@ class MEGATrainer:
                 print(f"\n  [Early Stop] No recall improvement for {patience} epochs. Best: {best_recall:.1f}% at epoch {best_epoch}.")
                 break
             
-            # Perfect recall — stop early
-            if best_recall >= 100.0:
-                print(f"\n  [Perfect Recall] 100% eval recall at epoch {epoch}. Stopping.")
+            # Perfect recall — stop early only if distillation loss is also minimized (or not used)
+            if best_recall >= 100.0 and (self.distill_lambda == 0.0 or avg_distill < 0.15):
+                print(f"\n  [Perfect Recall] 100% eval recall and minimized distillation loss at epoch {epoch}. Stopping.")
                 break
         
         # Restore the best weights
         if best_state_dict is not None:
             self.pipeline.men.load_state_dict(best_state_dict)
+            self._save_men_checkpoint()
             
         self.pipeline.men.eval()
         print(f"\n=== TRAINING COMPLETE === Best eval recall: {best_recall:.1f}% (epoch {best_epoch})")

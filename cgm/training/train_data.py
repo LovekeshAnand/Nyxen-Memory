@@ -421,7 +421,7 @@ EVAL_KEYS = [
 ]
 
 
-def encode_triple(triple: List[str], embed_fn, all_triples: Optional[List[List[str]]] = None) -> np.ndarray:
+def encode_triple(triple: List[str], embed_fn, all_triples: Optional[List[List[str]]] = None, expand_neighbors: bool = False) -> np.ndarray:
     """
     Encodes a triple into a 768-dim vector using the proper [enc(subj||pred); enc(obj)] structure.
     If all_triples is provided, it searches for 2-hop connected subgraphs and encodes them as a relational path.
@@ -438,7 +438,7 @@ def encode_triple(triple: List[str], embed_fn, all_triples: Optional[List[List[s
     left_text = f"{s} {p}"
     right_text = o
     
-    if all_triples:
+    if all_triples and expand_neighbors:
         # 1. Forward connection: find another triple starting with our object
         forward_conn = None
         for ot in all_triples:

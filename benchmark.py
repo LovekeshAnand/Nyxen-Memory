@@ -292,15 +292,13 @@ def train_men_on_dialogue_history(pipeline, conversation_id="test_conversation_9
     triples = [[row["subject"], row["predicate"], row["object"]] for row in rows]
     print(f"  [MEN Train] Found {len(triples)} triples in graph store.")
     
-    # Train on all samples to ensure complete memorization of the dialogue history
     all_samples = build_training_samples(triples, pipeline.retriever.embed_text)
-    train_samples = all_samples
-    eval_samples = all_samples
+    # Disjoint train/eval split for generalization measurement
+    train_samples, eval_samples = split_train_eval(all_samples)
     
-    print(f"  [MEN Train] Full memory training: {len(train_samples)} samples, Eval: {len(eval_samples)} samples")
+    print(f"  [MEN Train] Train: {len(train_samples)} samples, Eval: {len(eval_samples)} samples")
     
-    # Create trainer with KV-distillation enabled (using low distillation weight of 0.05 to avoid next-token degradation)
-    trainer = MEGATrainer(pipeline, lr=5e-4, distill_lambda=0.05)
+    trainer = MEGATrainer(pipeline, lr=5e-4, distill_lambda=0.5)
     trainer.mem_guard.enforce_safety = lambda *args, **kwargs: None
     
     # Run full training loop
