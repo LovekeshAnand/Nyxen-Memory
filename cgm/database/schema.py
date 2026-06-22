@@ -25,6 +25,7 @@ class HybridMemoryObject:
     user_text: Optional[str] = None
     assistant_text: Optional[str] = None
     raw_embedding: Optional[np.ndarray] = None
+    dia_id: Optional[str] = None
 
 
 class SQLiteGraphStore:
@@ -67,12 +68,13 @@ class SQLiteGraphStore:
                     uncertainty_scores TEXT,
                     tenant_id TEXT DEFAULT 'default_tenant',
                     user_id TEXT DEFAULT 'default_user',
+                    dia_id TEXT,
                     PRIMARY KEY (conversation_id, turn_id, tenant_id, user_id)
                 )
             """)
             
             # Migration helper for turns
-            for col in ["user_text TEXT", "assistant_text TEXT", "tenant_id TEXT DEFAULT 'default_tenant'", "user_id TEXT DEFAULT 'default_user'"]:
+            for col in ["user_text TEXT", "assistant_text TEXT", "tenant_id TEXT DEFAULT 'default_tenant'", "user_id TEXT DEFAULT 'default_user'", "dia_id TEXT"]:
                 try:
                     cursor.execute(f"ALTER TABLE turns ADD COLUMN {col}")
                 except sqlite3.OperationalError:
@@ -203,8 +205,8 @@ class SQLiteGraphStore:
                 # Insert Turn metadata
                 cursor.execute("""
                     INSERT OR REPLACE INTO turns 
-                    (conversation_id, turn_id, timestamp, summary, user_text, assistant_text, episodic_events, uncertainty_scores, tenant_id, user_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (conversation_id, turn_id, timestamp, summary, user_text, assistant_text, episodic_events, uncertainty_scores, tenant_id, user_id, dia_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     conversation_id,
                     hmo.turn_id,
@@ -215,7 +217,8 @@ class SQLiteGraphStore:
                     json.dumps(hmo.episodic_events),
                     json.dumps(hmo.uncertainty_scores),
                     tenant_id,
-                    user_id
+                    user_id,
+                    hmo.dia_id
                 ))
                 
                 # Insert Entities
@@ -286,7 +289,7 @@ class SQLiteGraphStore:
                         cursor.execute("""
                             INSERT OR REPLACE INTO embeddings (conversation_id, turn_id, embedding_type, dimensions, data, tenant_id, user_id)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (hmo.turn_id, embed_type, dims_str, data_bytes, conversation_id, tenant_id, user_id))
+                        """, (conversation_id, hmo.turn_id, embed_type, dims_str, data_bytes, tenant_id, user_id))
                 
                 # Insert turn-level raw embedding if present
                 if hmo.raw_embedding is not None:

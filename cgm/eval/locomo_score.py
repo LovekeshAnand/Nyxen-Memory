@@ -102,23 +102,42 @@ def aggregate_results(
     """Aggregate per-item F1 scores into overall and per-category means."""
     by_category: Dict[int, List[float]] = {}
     all_scores: List[float] = []
+    
+    # Retrieval recall aggregation
+    retrieval_scores: List[float] = []
+    by_category_retrieval: Dict[int, List[float]] = {}
 
     for row in results:
         f1 = row.get(score_key, 0.0)
         cat = int(row.get("category", 0))
         all_scores.append(f1)
         by_category.setdefault(cat, []).append(f1)
+        
+        if "retrieval_recall" in row:
+            rr = row["retrieval_recall"]
+            retrieval_scores.append(rr)
+            by_category_retrieval.setdefault(cat, []).append(rr)
 
     per_category = {
         CATEGORY_NAMES.get(cat, str(cat)): round(float(np.mean(scores)) * 100, 2)
         for cat, scores in sorted(by_category.items())
     }
 
-    return {
+    per_category_retrieval = {
+        CATEGORY_NAMES.get(cat, str(cat)): round(float(np.mean(scores)) * 100, 2)
+        for cat, scores in sorted(by_category_retrieval.items())
+    }
+
+    res = {
         "overall_f1": round(float(np.mean(all_scores)) * 100, 2) if all_scores else 0.0,
         "num_questions": len(all_scores),
         "per_category": per_category,
     }
+    if retrieval_scores:
+        res["overall_retrieval_recall"] = round(float(np.mean(retrieval_scores)) * 100, 2)
+        res["per_category_retrieval"] = per_category_retrieval
+        
+    return res
 
 
 def is_abstention_correct(prediction: str) -> bool:

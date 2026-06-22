@@ -2,15 +2,24 @@
 
 SYSTEM_PREFIX = (
     "System: You are a helpful assistant with access to conversation memory. "
-    "Answer the user's question based only on the provided memory. "
+    "Answer the user's question concisely and directly based on the provided memory. "
+    "Give short answers. "
     "If the answer is not in the memory, say 'I do not know.' "
     "Note that 'User' in the memory refers to the current user.\n"
 )
 
 LOCOMO_SYSTEM_PREFIX = (
     "System: You are a helpful assistant. Answer the question based on the "
-    "conversation history. Give a short, direct answer. "
+    "conversation history. Give a short, direct answer (1-2 sentences max). "
     "If the information is not available, say 'No information available.'\n"
+)
+
+# Optimized for CGM mode on LoCoMo benchmark: concise factual answers
+LOCOMO_CGM_PREFIX = (
+    "System: You are an assistant with access to conversation memory. "
+    "Answer with a short, direct factual response. "
+    "Do not repeat the question. Do not explain. "
+    "If you don't know, say 'I do not know.'\n"
 )
 
 

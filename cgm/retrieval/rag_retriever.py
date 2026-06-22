@@ -79,6 +79,7 @@ class TurnMemory:
     score: float
     conversation_id: str = "default_conv"
     embedding: Optional[np.ndarray] = None
+    dia_id: Optional[str] = None
 
 class RAGRetriever:
     """
@@ -194,7 +195,8 @@ class RAGRetriever:
 
     def store_turn(self, conversation_id: str, turn_id: int, text: str, 
                    summary: Optional[str] = None, user_text: Optional[str] = None, 
-                   assistant_text: Optional[str] = None, tenant_id: str = "default_tenant", user_id: str = "default_user"):
+                   assistant_text: Optional[str] = None, tenant_id: str = "default_tenant", user_id: str = "default_user",
+                   dia_id: Optional[str] = None):
         embedding = self.embed_text(text)
         index_id = self.encode_id(conversation_id, turn_id)
         with GPULockManager():
@@ -211,7 +213,8 @@ class RAGRetriever:
             summary=summary,
             user_text=user_text or text,
             assistant_text=assistant_text or "",
-            raw_embedding=embedding
+            raw_embedding=embedding,
+            dia_id=dia_id
         )
         self.store.save_hmo(conversation_id, hmo, tenant_id=tenant_id, user_id=user_id)
         self.persist()
@@ -239,13 +242,13 @@ class RAGRetriever:
             cursor = conn.cursor()
             if time_window is not None:
                 cursor.execute("""
-                    SELECT turn_id, user_text, assistant_text, summary FROM turns
+                    SELECT turn_id, user_text, assistant_text, summary, dia_id FROM turns
                     WHERE conversation_id = ? AND tenant_id = ? AND user_id = ?
                     ORDER BY turn_id DESC LIMIT ?
                 """, (conversation_id, tenant_id, user_id, time_window))
             else:
                 cursor.execute("""
-                    SELECT turn_id, user_text, assistant_text, summary FROM turns
+                    SELECT turn_id, user_text, assistant_text, summary, dia_id FROM turns
                     WHERE conversation_id = ? AND tenant_id = ? AND user_id = ?
                 """, (conversation_id, tenant_id, user_id))
             all_turns = cursor.fetchall()
@@ -287,17 +290,44 @@ class RAGRetriever:
                     turn_id = int(tid) & 0xFFFF
                     dense_scores_dict[turn_id] = float(scores[idx])
 
-        # 4. Reciprocal Rank Fusion (RRF)
+        # Entity-Graph keyword overlap retrieval
+        import re
+        stop_words = {"what", "is", "the", "of", "in", "on", "to", "for", "a", "an", "and", "or", "but", "with", "at", "by", "from", "when", "where", "who", "how", "why", "did", "does", "do", "was", "were", "go", "went", "has", "have", "had", "been", "about"}
+        query_words = set(re.findall(r'\b\w+\b', query.lower())) - stop_words
+        
+        graph_turns = set()
+        if query_words:
+            with self.store._lock:
+                conn = self.store._get_connection()
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT turn_id, subject, object FROM triples
+                    WHERE conversation_id = ? AND tenant_id = ? AND user_id = ? AND valid_until IS NULL AND is_negated = 0
+                """, (conversation_id, tenant_id, user_id))
+                triples_rows = cursor.fetchall()
+                conn.close()
+                
+            for row in triples_rows:
+                t_id = row["turn_id"]
+                subj_words = set(re.findall(r'\b\w+\b', (row["subject"] or "").lower()))
+                obj_words = set(re.findall(r'\b\w+\b', (row["object"] or "").lower()))
+                if (subj_words & query_words) or (obj_words & query_words):
+                    graph_turns.add(t_id)
+
+        # 4. Reciprocal Rank Fusion (RRF) with Entity-Graph Boost
         sparse_rank = {turn_id: rank for rank, (turn_id, _) in enumerate(sparse_scores)}
         sorted_dense = sorted(dense_scores_dict.items(), key=lambda x: x[1], reverse=True)
         dense_rank = {turn_id: rank for rank, (turn_id, _) in enumerate(sorted_dense)}
         
         rrf_scores = {}
-        all_turn_ids = set(sparse_rank.keys()) | set(dense_rank.keys())
+        all_turn_ids = (set(sparse_rank.keys()) | set(dense_rank.keys()) | graph_turns) & set(turn_dict.keys())
         for turn_id in all_turn_ids:
             rank_sparse = sparse_rank.get(turn_id, 9999)
             rank_dense = dense_rank.get(turn_id, 9999)
-            rrf_scores[turn_id] = (1.0 / (60.0 + rank_sparse)) + (1.0 / (60.0 + rank_dense))
+            base_score = (1.0 / (60.0 + rank_sparse)) + (1.0 / (60.0 + rank_dense))
+            if turn_id in graph_turns:
+                base_score += 0.5  # Substantial boost for direct entity-graph matches
+            rrf_scores[turn_id] = base_score
             
         sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
         candidate_ids = [turn_id for turn_id, _ in sorted_rrf[:max(20, k * 2)]]
@@ -325,7 +355,8 @@ class RAGRetriever:
                     assistant_text=a_txt,
                     score=initial_score,
                     conversation_id=conversation_id,
-                    embedding=embedding
+                    embedding=embedding,
+                    dia_id=row["dia_id"]
                 ))
                 
         if not candidates:
@@ -336,9 +367,16 @@ class RAGRetriever:
         try:
             with GPULockManager():
                 ce_scores = self.cross_encoder.predict(pairs)
+            # Normalize raw CE logits to [0,1] using min-max over this batch.
+            ce_arr = np.array(ce_scores, dtype=np.float32)
+            ce_min, ce_max = ce_arr.min(), ce_arr.max()
+            ce_range = ce_max - ce_min
+            if ce_range > 1e-6:
+                normalized = (ce_arr - ce_min) / ce_range
+            else:
+                normalized = np.ones_like(ce_arr) * 0.5
             for idx, cand in enumerate(candidates):
-                score_val = float(ce_scores[idx])
-                cand.score = 1.0 / (1.0 + np.exp(-score_val))
+                cand.score = float(normalized[idx])
             candidates = sorted(candidates, key=lambda x: x.score, reverse=True)
         except Exception as e:
             print(f"[RAGRetriever] Warning: Cross-Encoder reranking failed: {e}. Falling back to RRF rankings.")

@@ -32,7 +32,8 @@ class MemoryEncoderNetwork(nn.Module):
     of a target Frozen LLM for rectangular attention injection.
     """
     def __init__(self, input_dim: int = 768, num_layers: int = 12, 
-                 num_heads: int = 12, head_dim: int = 64, use_routing: bool = True, rank: int = 64):
+                 num_heads: int = 12, head_dim: int = 64, use_routing: bool = True, rank: int = 64,
+                 tokens_per_triple: int = 8):
         """
         Args:
             input_dim: Dimension of the triple representation [enc(subj || pred); enc(obj)] (e.g., 2 * 384 = 768)
@@ -41,12 +42,14 @@ class MemoryEncoderNetwork(nn.Module):
             head_dim: Dimension per key-value head in the target LLM (e.g., 64 for GPT-2)
             use_routing: Whether to use learned semantics-aware KV head/layer routing
             rank: Rank of low-rank projections (LoRA style)
+            tokens_per_triple: Number of key-value tokens generated per semantic triple
         """
         super().__init__()
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.output_dim = num_heads * head_dim
+        self.tokens_per_triple = tokens_per_triple
+        self.output_dim = tokens_per_triple * num_heads * head_dim
         self.use_routing = use_routing
 
         # Define key (K) and value (V) low-rank projection layers for each LLM layer
@@ -95,6 +98,9 @@ class MemoryEncoderNetwork(nn.Module):
                         idx = l * num_heads + h
                         self.routing_gate[2].bias[idx] = bias_val
 
+        # Global learned scaling factor for projected K/V cache states to prevent OOM/extreme gradients at initialization
+        self.kv_scale = nn.Parameter(torch.tensor(1.0))
+
     def forward(self, x: torch.Tensor) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -102,7 +108,7 @@ class MemoryEncoderNetwork(nn.Module):
             
         Returns:
             A list of length `num_layers` containing tuples of (key_states, value_states),
-            where each state has shape: (batch_size, num_heads, M, head_dim).
+            where each state has shape: (batch_size, num_heads, M * tokens_per_triple, head_dim).
         """
         batch_size, M, _ = x.shape
         past_key_values = []
@@ -111,36 +117,40 @@ class MemoryEncoderNetwork(nn.Module):
         if self.use_routing:
             # Shape: (batch_size, M, num_layers * num_heads)
             gates = self.routing_gate(x)
-            # Reshape to (batch_size, M, num_layers, num_heads, 1) for broadcasting
+            # Reshape to (batch_size, M, self.num_layers, self.num_heads, 1) for broadcasting
             gates = gates.view(batch_size, M, self.num_layers, self.num_heads, 1)
+            # Expand gates to cover the tokens per triple: (batch_size, M, L, self.num_layers, self.num_heads, 1)
+            gates = gates.unsqueeze(2).expand(-1, -1, self.tokens_per_triple, -1, -1, -1)
+            # Reshape to (batch_size, M * self.tokens_per_triple, self.num_layers, self.num_heads, 1)
+            gates = gates.reshape(batch_size, M * self.tokens_per_triple, self.num_layers, self.num_heads, 1)
         else:
             gates = None
 
         for layer_idx in range(self.num_layers):
             # Project key states
-            # (batch_size, M, input_dim) -> (batch_size, M, num_heads * head_dim)
+            # (batch_size, M, input_dim) -> (batch_size, M, tokens_per_triple * num_heads * head_dim)
             k_proj = self.k_projections[layer_idx](x)
-            k_proj = self.k_norms[layer_idx](k_proj)  # Magnitude matching
+            k_proj = self.k_norms[layer_idx](k_proj) * self.kv_scale  # Magnitude matching & scaling
             
-            # Reshape to (batch_size, M, num_heads, head_dim)
-            k_states = k_proj.view(batch_size, M, self.num_heads, self.head_dim)
+            # Reshape to (batch_size, M * tokens_per_triple, self.num_heads, self.head_dim)
+            k_states = k_proj.view(batch_size, M * self.tokens_per_triple, self.num_heads, self.head_dim)
 
             # Project value states
-            # (batch_size, M, input_dim) -> (batch_size, M, num_heads * head_dim)
+            # (batch_size, M, input_dim) -> (batch_size, M, tokens_per_triple * num_heads * head_dim)
             v_proj = self.v_projections[layer_idx](x)
-            v_proj = self.v_norms[layer_idx](v_proj)  # Magnitude matching
+            v_proj = self.v_norms[layer_idx](v_proj) * self.kv_scale  # Magnitude matching & scaling
             
-            # Reshape to (batch_size, M, num_heads, head_dim)
-            v_states = v_proj.view(batch_size, M, self.num_heads, self.head_dim)
+            # Reshape to (batch_size, M * self.tokens_per_triple, self.num_heads, self.head_dim)
+            v_states = v_proj.view(batch_size, M * self.tokens_per_triple, self.num_heads, self.head_dim)
 
             # Apply semantics-aware routing weights if active
             if gates is not None:
-                # Extract layer gate: shape (batch_size, M, num_heads, 1)
+                # Extract layer gate: shape (batch_size, M * tokens_per_triple, num_heads, 1)
                 layer_gate = gates[:, :, layer_idx, :, :]
                 k_states = k_states * layer_gate
                 v_states = v_states * layer_gate
 
-            # Permute to (batch_size, num_heads, M, head_dim) for HF cache compatibility
+            # Permute to (batch_size, num_heads, M * tokens_per_triple, head_dim) for HF cache compatibility
             k_states = k_states.permute(0, 2, 1, 3)
             v_states = v_states.permute(0, 2, 1, 3)
 

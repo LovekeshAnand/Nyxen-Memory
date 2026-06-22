@@ -31,12 +31,20 @@ class CGMPipeline:
         device: str = None,
         rank: int = 64,
         men_checkpoint: str = "data/checkpoints/men_state_dict.pt",
+        use_zero_shot: bool = False,
+        abstention_threshold: float = 0.0,
+        tokens_per_triple: int = 8,
+        use_routing: bool = True,
     ):
         self.db_path = db_path
         self.model_name = model_name
         self.device = device
         self.rank = rank
         self.men_checkpoint = men_checkpoint
+        self.use_zero_shot = use_zero_shot
+        self.abstention_threshold = abstention_threshold
+        self.tokens_per_triple = tokens_per_triple
+        self.use_routing = use_routing
         
         # Initialize GPU guards
         self.mem_guard = GPUMemoryGuard()
@@ -63,24 +71,28 @@ class CGMPipeline:
         """Load trained MEN weights if a compatible checkpoint exists."""
         if not self.men_checkpoint:
             return
-        if not torch.cuda.is_available() and self.device is None:
-            map_location = "cpu"
-        else:
-            map_location = self.device or "cpu"
-        try:
-            checkpoint = torch.load(self.men_checkpoint, map_location=map_location)
-        except FileNotFoundError:
-            if verbose:
-                print(f"[Pipeline] No MEN checkpoint found at {self.men_checkpoint}; using random init.")
-            return
-        except Exception as exc:
-            if verbose:
-                print(f"[Pipeline] Warning: Could not load MEN checkpoint: {exc}")
-            return
+        
+        checkpoint = getattr(self, "_loaded_checkpoint", None)
+        if checkpoint is None:
+            if not torch.cuda.is_available() and self.device is None:
+                map_location = "cpu"
+            else:
+                map_location = self.device or "cpu"
+            try:
+                import os
+                if not os.path.exists(self.men_checkpoint):
+                    if verbose:
+                        print(f"[Pipeline] No MEN checkpoint found at {self.men_checkpoint}; using random init.")
+                    return
+                checkpoint = torch.load(self.men_checkpoint, map_location=map_location)
+            except Exception as exc:
+                if verbose:
+                    print(f"[Pipeline] Warning: Could not load MEN checkpoint: {exc}")
+                return
 
         state_dict = checkpoint.get("state_dict", checkpoint)
         try:
-            self._men.load_state_dict(state_dict)
+            self._men.load_state_dict(state_dict, strict=False)
             if verbose:
                 print(f"[Pipeline] Loaded trained MEN weights from {self.men_checkpoint}.")
         except Exception as exc:
@@ -95,15 +107,27 @@ class CGMPipeline:
         # Always initialize store and retriever (which loads sentence transformers)
         self._store = SQLiteGraphStore(self.db_path)
         
-        # Detect device
+        # Detect device (proactively fallback to CPU if VRAM is congested to avoid swapping freezes)
         if self.device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                from cgm.safety.safety import get_gpu_vram_info
+                free_bytes, total_bytes = get_gpu_vram_info()
+                free_mb = free_bytes / (1024 * 1024)
+                if free_mb < 1500.0:
+                    print(f"[Pipeline] Proactive Warning: GPU VRAM is very low ({free_mb:.1f} MB free). Falling back to CPU to prevent swapping freezes.")
+                    self.device = "cpu"
+                else:
+                    self.device = "cuda"
+            else:
+                self.device = "cpu"
 
-        self._retriever = RAGRetriever(self._store, device=self.device)
+        # Force retriever (SentenceTransformer and CrossEncoder) to CPU to save ~800MB GPU VRAM.
+        # This prevents VRAM spillage and slow PCIe memory paging on 4GB/8GB GPUs.
+        self._retriever = RAGRetriever(self._store, device="cpu")
         
-        # Warm up retriever to cache SentenceTransformer in GPU VRAM during boot
+        # Warm up retriever to cache SentenceTransformer in RAM during boot
         if verbose:
-            print("[Pipeline] Warming up SentenceTransformer embedder on GPU...")
+            print("[Pipeline] Warming up SentenceTransformer embedder on CPU...")
         _ = self._retriever.embed_text("warmup query")
 
         if self.use_ollama:
@@ -144,11 +168,43 @@ class CGMPipeline:
                 if self._tokenizer.pad_token is None:
                     self._tokenizer.pad_token = self._tokenizer.eos_token
                     
+                # Dynamically set dtype: float32 for CPU (float16 matrix multiplication is unoptimized and extremely slow on CPU)
+                # and float16 for GPU.
+                model_dtype = torch.float32 if self.device == "cpu" else torch.float16
+                dtype_name = "float32" if model_dtype == torch.float32 else "float16"
                 if verbose:
-                    print(f"[Pipeline] Loading LLM '{self.model_name}' on device: {self.device}...")
-                self._model = AutoModelForCausalLM.from_pretrained(self.model_name)
+                    print(f"[Pipeline] Loading LLM '{self.model_name}' in {dtype_name} on device: {self.device}...")
+                self._model = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=model_dtype)
                 self._model.to(self.device)
                 self._model.eval()
+                
+                # Pre-read checkpoint config to align hyperparameters if present
+                if self.men_checkpoint:
+                    import os
+                    if os.path.exists(self.men_checkpoint):
+                        try:
+                            # Load on CPU to align metadata first
+                            checkpoint = torch.load(self.men_checkpoint, map_location="cpu")
+                            self._loaded_checkpoint = checkpoint
+                            ckpt_rank = checkpoint.get("rank")
+                            ckpt_use_routing = checkpoint.get("use_routing")
+                            ckpt_tokens_per_triple = checkpoint.get("tokens_per_triple")
+                            
+                            if ckpt_rank is not None and ckpt_rank != self.rank:
+                                if verbose:
+                                    print(f"[Pipeline] Aligning rank to checkpoint: {ckpt_rank} (was {self.rank})")
+                                self.rank = ckpt_rank
+                            if ckpt_use_routing is not None and ckpt_use_routing != self.use_routing:
+                                if verbose:
+                                    print(f"[Pipeline] Aligning use_routing to checkpoint: {ckpt_use_routing} (was {self.use_routing})")
+                                self.use_routing = ckpt_use_routing
+                            if ckpt_tokens_per_triple is not None and ckpt_tokens_per_triple != self.tokens_per_triple:
+                                if verbose:
+                                    print(f"[Pipeline] Aligning tokens_per_triple to checkpoint: {ckpt_tokens_per_triple} (was {self.tokens_per_triple})")
+                                self.tokens_per_triple = ckpt_tokens_per_triple
+                        except Exception as e:
+                            if verbose:
+                                print(f"[Pipeline] Warning: Could not pre-read checkpoint metadata: {e}")
                 
                 # Get LLM architecture parameters for MEN mapping (robust for GQA/MQA)
                 config = self._model.config
@@ -165,11 +221,15 @@ class CGMPipeline:
                 if verbose:
                     print(f"[Pipeline] LLM Config: {num_layers} layers, {num_heads} KV heads, {head_dim} head_dim.")
                 
-                # Initialize MEN model with routing enabled for architecture novelty
+                # Initialize MEN model
                 if verbose:
-                    print(f"[Pipeline] Initializing Memory Encoder Network (MEN) with Semantics-Aware Routing (rank={self.rank})...")
+                    print(f"[Pipeline] Initializing Memory Encoder Network (MEN) (use_routing={self.use_routing}, rank={self.rank})...")
                 # input_dim matches 2 * embedding dimension of all-MiniLM-L6-v2 (2 * 384 = 768)
-                self._men = MemoryEncoderNetwork(input_dim=768, num_layers=num_layers, num_heads=num_heads, head_dim=head_dim, use_routing=True, rank=self.rank)
+                self._men = MemoryEncoderNetwork(
+                    input_dim=768, num_layers=num_layers, num_heads=num_heads, 
+                    head_dim=head_dim, use_routing=self.use_routing, rank=self.rank,
+                    tokens_per_triple=self.tokens_per_triple
+                )
                 self._men.to(self.device)
                 self._men.eval()
                 self._load_men_checkpoint(verbose=verbose)
@@ -222,6 +282,7 @@ class CGMPipeline:
         user_id: str = "default_user",
         max_injected_triples: int = 20,
         persist_response: bool = True,
+        system_prefix: str = None,
     ) -> str:
         """
         Runs pipeline: retrieves memories -> projects memory -> injects KVs -> generates response.
@@ -255,9 +316,9 @@ class CGMPipeline:
         memories = session_mems + user_mems + tenant_mems
         
         # 3b. Abstention Check: If the highest similarity score is below threshold, return non-committal response directly.
-        threshold = 0.01
+        threshold = self.abstention_threshold
         max_score = max([m.score for m in memories]) if memories else 0.0
-        if not memories or max_score < threshold:
+        if threshold > 0.0 and (not memories or max_score < threshold):
             print(f"[Pipeline] Abstention active: max memory similarity score {max_score:.4f} < {threshold}. Bypassing generation and returning abstention.")
             return "I do not have information about that in my memory."
             
@@ -407,10 +468,10 @@ class CGMPipeline:
                 
                 # Validate input bounds
                 InputBufferGuard.validate_tensor_bounds(x_tensor.shape[1])
-                memory_length = x_tensor.shape[1]  # Number of memory positions (= total triples)
+                memory_length = x_tensor.shape[1] * self.men.tokens_per_triple  # Number of memory positions
                 
                 # Pass through MEN to generate past_key_values (with memoization)
-                cache_key_bytes = bytes([1 if self.men.use_routing else 0]) + x_tensor.cpu().numpy().tobytes()
+                cache_key_bytes = conversation_id.encode('utf-8') + bytes([1 if self.men.use_routing else 0]) + x_tensor.cpu().numpy().tobytes()
                 cache_key = hashlib.md5(cache_key_bytes).hexdigest()
                 
                 with torch.no_grad():
@@ -457,7 +518,7 @@ class CGMPipeline:
 
         # 5. Build prompt
         from cgm.eval.prompts import SYSTEM_PREFIX
-        system_prefix = SYSTEM_PREFIX
+        active_prefix = system_prefix if system_prefix is not None else SYSTEM_PREFIX
         if mode == "text" and memories:
             # Sort retrieved memories chronologically to maintain temporal history context
             sorted_memories = sorted(memories, key=lambda m: m.turn_id)
@@ -470,9 +531,9 @@ class CGMPipeline:
                 else:
                     summary_parts.append(f"Turn {mem.turn_id} - User: {user_msg}")
             summary_context = "\n".join(summary_parts)
-            prompt = f"{system_prefix}Distilled Past Conversation History:\n{summary_context}\n\nUser: {query_clean}\nAssistant:"
+            prompt = f"{active_prefix}Distilled Past Conversation History:\n{summary_context}\n\nUser: {query_clean}\nAssistant:"
         else:
-            prompt = f"{system_prefix}User: {query_clean}\nAssistant:"
+            prompt = f"{active_prefix}User: {query_clean}\nAssistant:"
             
         # 6. Run generation
         if self.use_ollama:
@@ -512,6 +573,19 @@ class CGMPipeline:
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
             InputBufferGuard.validate_tensor_bounds(inputs.input_ids.shape[1])
             
+            # Run compression proactively if active cache is set up and VRAM is low
+            if not self.use_ollama and past_key_values is not None and memory_length > 0:
+                free_bytes, total_bytes = self.mem_guard.check_vram()
+                if total_bytes > 0:
+                    free_mb = free_bytes / (1024 * 1024)
+                    if free_mb < 800.0:
+                        if not hasattr(self, "compressor") or self.compressor is None:
+                            from cgm.core.compressor import KVCompressor
+                            self.compressor = KVCompressor(hot_window=128)
+                            self.compressor.start_background_monitor(self)
+                        self.compressor.compress(self, past_key_values)
+                        memory_length = past_key_values.get_seq_length()
+
             position_ids = None
             if past_key_values is not None and memory_length > 0:
                 memory_mask = torch.ones(1, memory_length, dtype=torch.long, device=self.device)
@@ -566,11 +640,11 @@ class CGMPipeline:
                             do_sample=False
                         )
                     
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            if response.startswith(prompt):
-                response = response[len(prompt):].strip()
+            # Decode only the newly generated tokens (skip input prompt tokens)
+            new_tokens = outputs[0][inputs.input_ids.shape[1]:]
+            response = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
                 
-            for stop_word in ["\nUser:", "\nAssistant:", "\n👤", "\n🤖", "User:", "Assistant:"]:
+            for stop_word in ["\nUser:", "\nAssistant:", "\n👤", "\n🤖"]:
                 if stop_word in response:
                     response = response.split(stop_word)[0].strip()
                 
@@ -610,7 +684,7 @@ class CGMPipeline:
                 if free_mb < 800.0:
                     if not hasattr(self, "compressor") or self.compressor is None:
                         from cgm.core.compressor import KVCompressor
-                        self.compressor = KVCompressor()
+                        self.compressor = KVCompressor(hot_window=128)
                         self.compressor.start_background_monitor(self)
                     # Proactively run a compression step
                     if self.active_cache is not None:

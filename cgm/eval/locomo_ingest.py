@@ -30,15 +30,40 @@ def _normalize_relative_date(content: str, session_date: str) -> Optional[str]:
 
 def _simple_extract_triples(text: str, speaker_a: str, session_date: str = "") -> List[List[str]]:
     """
-    Lightweight regex/heuristic triple extraction for benchmark ingest.
-    Produces [subject, predicate, object] triples from dialogue lines.
-    Full LLM extraction can replace this in Phase 2.
+    Enhanced triple extraction for LoCoMo benchmark ingest.
+    Handles facts, events, preferences, dates, relationships, and activities.
+    Extracts structured triples from each dialogue line with multiple patterns.
     """
+    # Relation patterns in priority order (most specific first)
+    _VERB_PATTERNS = [
+        # Ownership / profession
+        (r"(?:i|i'm|my name is)\s+(\w+)", "speaker_name", None),
+        (r"(?:i|i'm)\s+(?:a|an)\s+(.+?)(?:\.|,|$)", "occupation", None),
+        (r"(?:i|i'm)\s+(?:working|employed)\s+(?:at|for|with)\s+(.+?)(?:\.|,|$)", "works_at", None),
+        (r"(?:i|i've)\s+(?:moved|relocated|moved back)\s+to\s+(.+?)(?:\.|,|$)", "moved_to", None),
+        (r"(?:i|i'm)\s+(?:living|staying|living now)\s+(?:in|at)\s+(.+?)(?:\.|,|$)", "lives_in", None),
+        # Activity patterns
+        (r"(?:i|we)\s+(went|traveled|flew|drove|visited|attended|joined)\s+(?:to\s+)?(.+?)(?:\.|,|$)", "visited", None),
+        (r"(?:i|we)\s+(bought|purchased|got|received|ordered)\s+(.+?)(?:\.|,|$)", "acquired", None),
+        (r"(?:i|we)\s+(started|began|tried|took up)\s+(.+?)(?:\.|,|$)", "started", None),
+        (r"(?:i|we)\s+(stopped|quit|gave up|ended)\s+(.+?)(?:\.|,|$)", "stopped", None),
+        (r"(?:i|we)\s+(like|love|enjoy|prefer|hate|dislike)\s+(.+?)(?:\.|,|$)", "preference", None),
+        # Factual statements
+        (r"(?:i|my)\s+(\w+)\s+(?:is|was|are|were)\s+(.+?)(?:\.|,|$)", "has_property", None),
+        (r"(.+?)\s+(?:is|was|are|were)\s+(?:called|named)\s+(.+?)(?:\.|,|$)", "named", None),
+        (r"(.+?)\s+(?:is|was|are|were)\s+(?:a|an|the)\s+(.+?)(?:\.|,|$)", "is_a", None),
+        (r"(.+?)\s+(?:happens?|occurred?|took place)\s+(?:on|at|in)\s+(.+?)(?:\.|,|$)", "occurred_at", None),
+        # Date/time patterns
+        (r"(?:on|at|in)\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d+(?:st|nd|rd|th)?)", "date", None),
+        (r"(?:on|at)\s+(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*(?:\d{4})?)", "date", None),
+    ]
+
     triples = []
     for line in text.split("\n"):
         line = line.strip()
         if not line or line.startswith("---"):
             continue
+
         # Parse "[D1:3] Speaker: text"
         m = re.match(r"\[(D\d+:\d+)\]\s*([^:]+):\s*(.+)", line)
         if not m:
@@ -46,42 +71,54 @@ def _simple_extract_triples(text: str, speaker_a: str, session_date: str = "") -
         dia_id, speaker, content = m.group(1), m.group(2).strip(), m.group(3).strip()
         if not content or len(content) < 5:
             continue
-        subj = speaker if speaker else "Unknown"
-        event_id = f"event:{dia_id}"
-        # Split on common relational patterns
+
+        # Use speaker_a's name directly as subject (avoid generic "User")
+        subj = speaker
+
         normalized_date = _normalize_relative_date(content, session_date)
         if normalized_date:
             triples.extend([
-                [event_id, "speaker", subj],
-                [event_id, "date", normalized_date],
-                [event_id, "text", content[:180]],
-                [subj, "mentioned_event", event_id],
+                [f"event:{dia_id}", "speaker", subj],
+                [f"event:{dia_id}", "date", normalized_date],
+                [f"event:{dia_id}", "description", content[:200]],
+                [subj, "event_date", normalized_date],
             ])
-        for pattern, pred in [
-            (r"(.+?)\s+(went to|visited|attended|joined|moved to|lives in|works at|works as|is a|is an|has a|has an|bought|got|received|started|stopped|decided|changed|updated|migrated|uses|used|likes|loves|hates|prefers)\s+(.+)",
-             None),
-            (r"(.+?)\s+(on|at|in|during)\s+(.+)",
-             "mentioned"),
-        ]:
-            match = re.match(pattern, content, re.IGNORECASE)
-            if match and pred is None:
-                obj = match.group(3).strip()
-                triples.append([subj, match.group(2).strip().lower(), obj])
-                if normalized_date:
-                    triples.append([subj, "event_date", normalized_date])
-                break
-            elif match and pred:
-                triples.append([subj, pred, content.strip()])
-                if normalized_date:
-                    triples.append([subj, "event_date", normalized_date])
-                break
+
+        # Core verb-based relation patterns
+        matched = False
+        for pattern, pred, obj_override in _VERB_PATTERNS:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                groups = match.groups()
+                if obj_override:
+                    obj = obj_override
+                elif len(groups) >= 2:
+                    obj = groups[-1].strip().rstrip(".,;!?")
+                else:
+                    obj = groups[0].strip().rstrip(".,;!?")
+                if obj and len(obj) > 1:
+                    triples.append([subj, pred, obj[:120]])
+                    if normalized_date:
+                        triples.append([subj, "event_date", normalized_date])
+                    matched = True
+                    break  # one structural triple per line
+
+        # Always add a full-text triple for dense retrieval coverage
+        clean_content = content[:200].rstrip(".,;!?")
+        if speaker == speaker_a:
+            triples.append([speaker_a, "said", clean_content])
         else:
-            # Fallback: speaker stated content
-            if speaker == speaker_a:
-                triples.append(["User", "said", content[:120]])
-            else:
-                triples.append([speaker, "said", content[:120]])
-    return triples[:50]  # cap per session
+            triples.append([speaker, "said", clean_content])
+
+        # Entity linking: extract proper nouns (capitalized words not at sentence start)
+        words = content.split()
+        for i, word in enumerate(words[1:], 1):
+            word_clean = word.rstrip(".,;!?\"'")
+            if (word_clean and word_clean[0].isupper() and len(word_clean) > 2
+                    and word_clean.lower() not in {"i", "the", "a", "an", "my", "we", "our", "you", "they"}):
+                triples.append([subj, "mentioned", word_clean])
+
+    return triples[:120]  # increased cap for better coverage
 
 
 def clear_conversation(pipeline, conversation_id: str, tenant_id: str = "default_tenant", user_id: str = "default_user"):
@@ -146,6 +183,7 @@ def seed_conversation(
                 user_text=turn.get("user_text") or turn["text"],
                 assistant_text=turn.get("assistant_text") or turn["text"],
                 triples=triples,
+                dia_id=turn.get("dia_id"),
             )
             hmo.raw_embedding = pipeline.retriever.embed_text(text)
             pipeline.store.save_hmo(cid, hmo, tenant_id=tenant_id, user_id=user_id)
@@ -158,6 +196,7 @@ def seed_conversation(
                 assistant_text=hmo.assistant_text,
                 tenant_id=tenant_id,
                 user_id=user_id,
+                dia_id=turn.get("dia_id"),
             )
     else:
         # Session-level fallback (legacy behavior)
@@ -194,6 +233,7 @@ def load_extracted_graph(pipeline, graph_path: str, conversation_id: str = "loco
             summary=f"Dialogue session {session['session_idx']}",
             user_text=f"Dialogue session {session['session_idx']}",
             assistant_text=text,
+            dia_id=f"D{session['session_idx']}:1",
         )
         hmo.raw_embedding = pipeline.retriever.embed_text(text)
         pipeline.store.save_hmo(conversation_id, hmo)

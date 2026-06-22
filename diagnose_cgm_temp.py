@@ -110,7 +110,7 @@ with torch.no_grad():
     past_kv = DynamicCache()
     attn_dtype = next(pipeline.model.parameters()).dtype
     
-    memory_length = x_all_tensor.shape[1]
+    memory_length = x_all_tensor.shape[1] * pipeline.men.tokens_per_triple
     pos_ids = torch.arange(memory_length, dtype=torch.long, device=pipeline.device).unsqueeze(0)
     dummy_x = torch.zeros(1, 1, memory_length, pipeline.model.config.hidden_size // pipeline.model.config.num_attention_heads).to(pipeline.device)
     cos, sin = pipeline.model.model.rotary_emb(dummy_x, pos_ids)

@@ -42,7 +42,7 @@ class KVCompressor:
     Evaluates key-value token importance based on attention history, and dynamically
     evicts/clusters cold-zone entries under strict safety locks and CUDA streams.
     """
-    def __init__(self, hot_window: int = 64, kl_threshold: float = 0.05, 
+    def __init__(self, hot_window: int = 128, kl_threshold: float = 0.05, 
                  check_interval_sec: float = 2.0, fidelity_mode: str = "cosine"):
         self.hot_window = hot_window
         self.kl_threshold = kl_threshold

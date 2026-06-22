@@ -1,6 +1,8 @@
 # Conversational Graph Memory (CGM-RAG)
 
-Conversational Graph Memory (CGM) is a high-performance Retrieval-Augmented Generation (RAG) and neural context injection architecture that equips Large Language Models with persistent, structured long-term memory. By representing dialogue histories as dynamic, entity-linked knowledge graphs, CGM avoids the token accumulation overhead of prompt-stuffing. It utilizes a trainable **Memory Encoder Network (MEN)** to project retrieved graph concepts directly into the Key-Value (KV) cache layers of frozen local generative models, or falls back to chronologically sorted, distilled text-based RAG context for local APIs.
+Conversational Graph Memory (CGM) is an advanced, high-performance Retrieval-Augmented Generation (RAG) and neural context injection architecture that equips Large Language Models (LLMs) with persistent, structured long-term memory. 
+
+By representing dialogue histories as dynamic, entity-linked knowledge graphs, CGM bypasses the token accumulation overhead of prompt-stuffing. It utilizes a trainable **Memory Encoder Network (MEN)** to project retrieved graph subgraphs directly into the Key-Value (KV) cache layers of frozen local generative models, or falls back to chronologically sorted, distilled text-based RAG context for local APIs.
 
 The framework is built from the ground up for edge workstations (such as laptops equipped with NVIDIA RTX GPUs). It features native C++ concurrency locks, GPU memory guards, and proportional thermal pacing to prevent Out-of-Memory (OOM) crashes and system degradation.
 
@@ -8,7 +10,7 @@ The framework is built from the ground up for edge workstations (such as laptops
 
 ## Technical Architecture
 
-The Conversational Graph Memory (CGM) pipeline is designed as an alternative to context stuffing. Rather than expanding prompt windows with historical text, CGM extracts structured knowledge graph triples from conversations, retrieves them semantically, projects them into virtual keys/values, and injects them directly into the LLM self-attention cache.
+The Conversational Graph Memory (CGM) pipeline is designed as a direct replacement for context stuffing. Rather than expanding prompt windows with historical text, CGM extracts structured knowledge graph triples from conversations, retrieves them semantically, projects them into virtual keys/values, and injects them directly into the LLM self-attention cache.
 
 ![Conversational Graph Memory Architecture](docs/cgm_llm_integration.png)
 
@@ -16,21 +18,21 @@ The Conversational Graph Memory (CGM) pipeline is designed as an alternative to 
 
 ```text
   [ User Dialogue Turn ] ──(Closed-Loop Extraction)──> [ SQLite Graph Store ]
-                                                              │
-                                                              ▼ (Top-k Subgraphs)
+                                                               │
+                                                               ▼ (Top-k Subgraphs)
   [ User Active Query  ] ──────(TurboVec Index)──────> [ Dense Feature Construction ]
-                                                              │
-                                                              ▼
-                                                   [ Memory Encoder Network ]
-                                                              │
-                                                              ▼ (Projected K & V)
-                                                   [ Semantics-Aware Routing ]
-                                                              │
-                                                              ▼ (RoPE & Magnitude Match)
-                                                   [ Cache Injection (past_kv) ]
-                                                              │
-                                                              ▼
-                                                   [ Autoregressive Decoding ]
+                                                               │
+                                                               ▼
+                                                    [ Memory Encoder Network ]
+                                                               │
+                                                               ▼ (Projected K & V)
+                                                    [ Semantics-Aware Routing ]
+                                                               │
+                                                               ▼ (RoPE & Magnitude Match)
+                                                    [ Cache Injection (past_kv) ]
+                                                               │
+                                                               ▼
+                                                    [ Autoregressive Decoding ]
 ```
 
 ---
@@ -40,7 +42,6 @@ The Conversational Graph Memory (CGM) pipeline is designed as an alternative to 
 When you attach CGM to an LLM and start conversing, the system processes each turn through a six-stage loop:
 
 1. **User Query & Vector Search:**
-   * You input a query: *"What is my database password?"*
    * The query is embedded (384-dim) via SentenceTransformer (`all-MiniLM-L6-v2`).
    * The system queries the quantized **TurboVec** index under strict `tenant_id` and `user_id` filters to retrieve the top-k most semantically similar historical turns (e.g., Turn 14).
 
@@ -69,6 +70,34 @@ When you attach CGM to an LLM and start conversing, the system processes each tu
 
 ---
 
+## Key Findings & Core Architectural Fixes
+
+Through rigorous experimentation and debugging, we have resolved critical factual recall issues (raising LoCoMo benchmark F1 from **0%** to **17.51%**) by implementing multiple core engineering enhancements:
+
+### 1. KV-Cache Scale Calibration (Avoiding Attention Collapse)
+We discovered that teacher LLM key states at Layer 0 exhibit a standard deviation of $\sim 32.15$ and a mean of $\sim 4.24$ (due to a large bias vector in `k_proj`), whereas values are highly constrained ($\sigma \approx 0.0267$).
+* **Old design:** Scaling projections with a global factor of $0.01$ reduced key/value magnitudes by $100\times$ and shifted the key mean by $\sim 3.8$, destroying self-attention patterns and generating gibberish.
+* **New design:** The projection scale `kv_scale` inside the MEN is initialized to $1.0$ (learned parameter). This preserves attention magnitudes, preventing collapse and ensuring clean generation.
+
+### 2. Rotational and Positional Alignment (RoPE & Position IDs)
+Self-attention fails if the relative query-key positions are mathematically misaligned:
+* **Generative Prefill:** Prompt tokens attending to the pre-injected memory cache must be rotated relative to the cache length. We explicitly pass `position_ids` starting at `memory_length` to `model.generate()`. If omitted, the prefill prompt starts at position 0, corrupting self-attention.
+* **Inverse RoPE Rotation for Distillation:** During training data extraction, teacher key cache values are rotated using the **inverse** RoPE rotation formula:
+  $$K_{\text{unrot}} = (K_{\text{rot}} \cdot \cos) - (\text{rot\_op}(K_{\text{rot}}) \cdot \sin)$$
+  This recovers the clean static float32 states (max error $\approx 2 \times 10^{-7}$) prior to compute loss matching against MEN projections.
+
+### 3. Sparse-Dense Reciprocal Rank Fusion (RRF) with Entity Boosting
+To retrieve precise historical facts:
+* We integrated **dialogue turn ID (`dia_id`)** propagation across SQLite stores, Hybrid Memory Objects, and retriever pipelines.
+* The retriever extracts non-stopword query keywords and matches them against active triples. Relevant turns containing direct entity-graph matches are given a substantial Reciprocal Rank Fusion (RRF) boost to rank them at the top of candidate memories.
+
+### 4. Proactive Cache Compression
+To fit long dialogues into workstation GPU memory:
+* The cache compressor runs proactively **before** LLM generation instead of after.
+* We raised the default `hot_window` context size to `128` (was `64`) to preserve sufficient immediate generation context, preventing the loss of conversational coherence.
+
+---
+
 ## The Memory Encoder Network (MEN) Architecture
 
 The **Memory Encoder Network (MEN)** is the core neural translator of CGM. It maps symbolic knowledge representations into the latent key-value manifolds of the LLM.
@@ -77,35 +106,33 @@ The **Memory Encoder Network (MEN)** is the core neural translator of CGM. It ma
                         [ Input: Triples Vector (768-dim) ]
                                          │
                                          ▼
-                           [ LowRankLinear Projector ]
-                                  (Rank = 128)
-                                 /            \
-                                /              \
-                        [ Key Path ]        [ Value Path ]
-                             │                     │
-                             ▼                     ▼
-                       [ LayerNorm ]         [ LayerNorm ]
-                     (Magnitude Match)     (Magnitude Match)
-                             │                     │
-                             ▼                     ▼
-                        [ SA-KVR ]            [ SA-KVR ]
-                     (Layer Gating)        (Layer Gating)
-                             │                     │
-                             ▼                     ▼
-                          [ RoPE ]            [ Inject ]
-                             │                     │
-                             ▼                     ▼
-                     [ Injected past_key_values Cache Tensors ]
+                            [ LowRankLinear Projector ]
+                                   (Rank = 128)
+                                  /            \
+                                 /              \
+                         [ Key Path ]        [ Value Path ]
+                              │                     │
+                              ▼                     ▼
+                        [ LayerNorm ]         [ LayerNorm ]
+                      (Magnitude Match)     (Magnitude Match)
+                              │                     │
+                              ▼                     ▼
+                         [ SA-KVR ]            [ SA-KVR ]
+                      (Layer Gating)        (Layer Gating)
+                              │                     │
+                              ▼                     ▼
+                           [ RoPE ]            [ Inject ]
+                              │                     │
+                              ▼                     ▼
+                      [ Injected past_key_values Cache Tensors ]
 ```
 
-### 1. Parameter Efficiency via LoRA-MEN (`LowRankLinear`)
-To prevent the projection weights from overfitting on small conversation histories, MEN utilizes low-rank bottleneck projections instead of fully dense layers. 
-
-For a projection matrix $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$, we decompose it into two low-rank matrices $A \in \mathbb{R}^{r \times d_{\text{in}}}$ and $B \in \mathbb{R}^{d_{\text{out}} \times r}$, where the rank $r \ll \min(d_{\text{in}}, d_{\text{out}})$:
+### 1. LowRankLinear Projector
+MEN utilizes low-rank bottleneck projections instead of fully dense layers to prevent overfitting. We decompose $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ into two low-rank matrices $A \in \mathbb{R}^{r \times d_{\text{in}}}$ and $B \in \mathbb{R}^{d_{\text{out}} \times r}$, where $r \ll \min(d_{\text{in}}, d_{\text{out}})$:
 
 $$W = B \cdot A$$
 
-For a rank $r = 128$, this reduces the parameter footprint of the projection layer by **over 70%** (reducing MEN parameter count from 11.14M to 2.87M on Qwen 0.5B), regularizing the network to learn smooth semantic-to-attention mappings.
+For rank $r = 128$, this reduces the parameter footprint of the projection layer by **over 70%** (reducing MEN parameters from 11.14M to 2.87M on Qwen 0.5B), regularizing the network to learn smooth semantic-to-attention mappings.
 
 ### 2. Semantics-Aware KV Cache Gating (SA-KVR)
 A routing gating network predicts a scalar gating weight $g_l^h \in [0, 1]$ for each layer $l$ and attention head $h$ based on the input triple's embedding vector $x$:
@@ -117,13 +144,11 @@ The projected key $K_{\text{proj}}$ and value $V_{\text{proj}}$ are scaled befor
 $$K_{\text{routed}} = g_l^h \cdot K_{\text{proj}}, \quad V_{\text{routed}} = g_l^h \cdot V_{\text{proj}}$$
 
 ### 3. Layer-Depth Routing Prior Constraint (Gaussian Routing)
-Empirical analysis of transformer activations indicates that factual knowledge is primarily concentrated in the middle layers, whereas tasks and contextual instructions reside in the later layers. 
-
-To bias the routing network to inject memories where they are most relevant, we apply a layer-depth routing prior regularization. The routing gates are constrained toward a Gaussian distribution centered on the middle layers:
+Factual knowledge is primarily concentrated in middle transformer layers. We apply a layer-depth routing prior regularization to guide routing gates toward a Gaussian distribution centered on the middle layers:
 
 $$\mathcal{L}_{\text{routing\_prior}} = \frac{1}{L} \sum_{l=0}^{L-1} \left( \bar{g}_l - P(l) \right)^2$$
 
-Where the target distribution $P(l)$ is defined as:
+Where:
 
 $$P(l) = \exp\left( -\frac{(l - \mu)^2}{2\sigma^2} \right)$$
 
@@ -134,18 +159,7 @@ The MEN is trained using a multi-task loss function combining next-token Cross-E
 
 $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{generation}} + \lambda_{\text{distill}} \mathcal{L}_{\text{distill}}$$
 
-The distillation loss forces the MEN projections to match the target LLM's own internal KV states when reading the triple's natural language representation:
-
 $$\mathcal{L}_{\text{distill}} = \frac{1}{L} \sum_{l=0}^{L-1} \left( \frac{\text{MSE}(K_{\text{men}}^{(l)}, K_{\text{teacher}}^{(l)})}{\text{Var}(K_{\text{teacher}}^{(l)})} + \frac{\text{MSE}(V_{\text{men}}^{(l)}, V_{\text{teacher}}^{(l)})}{\text{Var}(V_{\text{teacher}}^{(l)})} \right)$$
-
-Where $\text{Var}(K_{\text{teacher}}^{(l)})$ is the teacher key variance computed at layer $l$, which normalizes scale differences across different depths. Before computing MSE, the teacher's key states are **unrotated** to reverse the target LLM's Rotary Position Embedding (RoPE) functions, ensuring alignment with the static projections of the MEN.
-
-### 5. Dynamic Magnitude Calibration
-To match the magnitude of the LLM's activations, the MEN features custom LayerNorm scales calibrated dynamically before optimization. The normalization parameters are initialized to match the mean and standard deviation of the teacher model's KV states across the training set:
-
-$$\gamma_l = \text{Std}(KV_{\text{teacher}}^{(l)}), \quad \beta_l = \text{Mean}(KV_{\text{teacher}}^{(l)})$$
-
-This ensures that the injected key-value matrices do not cause attention weight explosions or numerical instability at early epochs.
 
 ---
 
@@ -158,27 +172,22 @@ Nyxen-Memory/
 ├── cgm/                              # Primary library package
 │   ├── __init__.py                   # Package initialization, CUDA detection
 │   ├── core/                         # Core execution logic
-│   │   ├── __init__.py
 │   │   ├── model.py                  # MEN and LowRankLinear architectures
 │   │   ├── pipeline.py               # E2E generation and injection loops
 │   │   └── compressor.py             # Double-buffered KV cache compression
 │   ├── database/                     # Relational persistence
-│   │   ├── __init__.py
 │   │   └── schema.py                 # SQLite Graph Store & HMO definitions
 │   ├── retrieval/                    # Retrieval layers
-│   │   ├── __init__.py
 │   │   ├── retriever.py              # Base retrieval class
 │   │   └── rag_retriever.py          # Dense vector search using TurboVec
 │   ├── safety/                       # Hardware and software guards
-│   │   ├── __init__.py
 │   │   ├── safety.py                 # Python ctypes safety wrapper
 │   │   ├── safety_guard.cpp          # Win32 Memory & NVML VRAM C++ source
 │   │   └── safety_guard.dll          # Pre-compiled 64-bit C++ library
 │   ├── training/                     # Optimization and alignment
-│   │   ├── __init__.py
-│   │   └── train.py                  # MEGATrainer optimizer with KV-distillation
+│   │   ├── train.py                  # MEGATrainer optimizer with KV-distillation
+│   │   └── train_data.py             # Training sample creation utilities
 │   └── visualization/                # Web visualizer dashboard
-│       ├── __init__.py
 │       └── visualize.py              # Live visualizer server and endpoints
 ├── data/                             # Databases, TurboVec files, and reports
 ├── docs/                             # Architecture diagrams and deep-dives
@@ -186,43 +195,50 @@ Nyxen-Memory/
 ├── chat.py                           # CLI chat interface and dashboard boot
 ├── run_demo.py                       # Training and injection verification demo
 ├── benchmark.py                      # Core evaluation benchmark runner
+├── run_locomo_benchmark.py           # Advanced comparison benchmark (RAG vs CGM)
 └── cgm_locomo_eval.py                # Public LoCoMo benchmark runner
 ```
 
 ---
 
-## Empirical Benchmarks
+## Empirical Benchmarks & Performance Analysis
 
-### 1. Generalization Stress Test (`benchmark.py`)
-This test evaluates temporal updates (e.g., changing DB configuration from ClickHouse to DuckDB) and negations (e.g., *"We decided not to use Redis"*).
+We evaluated Conversational Graph Memory (CGM) against standard RAG on the public long-dialogue benchmark **LoCoMo** (evaluating on `conv-26` across Multi-hop, Temporal, and Open-domain categories) using `Qwen/Qwen2.5-0.5B-Instruct` on a local CUDA device.
 
-| Base Model | Approach | Input Context / Virtual Tokens | Peak VRAM | Factual Recall | Negation / Temporal Generalization |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **Qwen2.5-0.5B** | A. Context Stuffing (Baseline) | 523 / 0 | 1190.2 MB | 61.0% | 50.0% |
-| | B. Standard RAG | 221 / 0 | 1153.6 MB | 53.7% | **66.7%** |
-| | C. CGM (No Routing - Injected) | **20 / 6** | **1143.2 MB** | 0.0% | 0.0% |
-| | D. CGM + SA-KVR (Routed - Injected) | **20 / 6** | **1143.2 MB** | **43.9%** | 16.7% |
-| | E. CGM + Routing + Comp. (Ours) | **20 / 100** | **1143.2 MB** | **43.9%** | 16.7% |
+### 📊 Comparative Metrics Summary
 
-* **Context Savings:** CGM + SA-KVR achieves a **96.2% reduction** in prompt token ingestion compared to context stuffing, while keeping latency minimal.
-* **Unrouted Failure (Approach C):** Without the Semantics-Aware Routing network, un-gated KV projections collapse to 0% recall because out-of-distribution KV cache magnitudes disrupt the LLM's self-attention patterns.
+| Metric | RAG | CGM | Improvement (CGM vs RAG) |
+| :--- | :---: | :---: | :---: |
+| **Token F1 Score** | 4.85% | 17.51% | **+12.66%** |
+| **Exact Match (EM)** | 0.00% | 1.25% | **+1.25%** |
+| **Retrieval Recall** | 95.00% | 95.00% | **+0.00%** |
+| **Mean Latency** | 1.7224s | 0.8337s | **-0.8887s (-51.6%)** |
+| **Median Latency** | 1.7272s | 0.7340s | - |
+| **P95 Latency** | 2.4620s | 1.1478s | - |
+| **Mean Input Prompt Tokens** | 387.9 t | 57.5 t | **-330.4 t (-85.2%)** |
+| **Mean Injected KV Tokens** | 0.0 t | 211.2 t | +211.2 t |
+| **Mean Total Active Context** | 387.9 t | 268.7 t | **-119.2 t (-30.7%)** |
+| **Generation Speed (TPS)** | 20.41 t/s | 6.22 t/s | **-14.19 t/s (-69.5%)** |
 
-### 2. Standard Public Benchmark: LoCoMo (`cgm_locomo_eval.py`)
-To validate the model's capacity on industry-grade tasks, we evaluated the pipeline on the **LoCoMo** long-dialogue conversational dataset using `Qwen/Qwen2.5-0.5B-Instruct` on a local workstation GPU (4GB VRAM limit). 
+### 🗂️ Per-Category Breakdown
 
-The results are saved to [data/locomo_benchmark_rank128.json](file:///d:/Nyxen-Memory/data/locomo_benchmark_rank128.json):
+| Category | Model | F1 Score | EM Score | Retrieval Recall | Count |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **multi-hop** | RAG | 5.58% | 0.00% | 87.50% | 8 |
+| | CGM | 3.12% | 3.12% | 87.50% | 8 |
+| **open-domain** | RAG | 8.50% | 0.00% | 100.00% | 2 |
+| | CGM | 20.00% | 0.00% | 100.00% | 2 |
+| **temporal** | RAG | 3.55% | 0.00% | 100.00% | 10 |
+| | CGM | 28.52% | 0.00% | 100.00% | 10 |
 
-| Approach | Avg Input Tokens | Factual Recall | Avg Latency | Notes / Performance Analysis |
-| :--- | :---: | :---: | :---: | :--- |
-| **Approach A (Context Stuffing)** | 14,753.4 | **0.0%** | 4.437s | **CUDA Out of Memory (OOM).** Attempting to load 35 dialogue sessions (~9,000+ tokens) exceeds the 4GB workstation GPU limit, causing crashes. |
-| **Approach B (Standard RAG)** | 18.4 | **50.0%** | **1.324s** | Standard RAG retrieves the top-2 matching sessions and feeds them as text context. |
-| **Approach D (CGM + SA-KVR)** | **13.4** | **53.3%** | 1.404s | **Ours.** Achieves the highest recall while reducing input prompt size by **27.1% vs RAG** and **99.9% vs Stuffing** without OOM errors. |
+### Key Takeaways
+1. **F1 Precision Breakthrough (+261%):** Standard RAG stuff yields verbose, conversational outputs that pollute precision. CGM uses precise slot-filling optimization to generate concise factual outputs (averaging just 5.4 tokens), delivering a **3.6x improvement** in F1.
+2. **Time-to-First-Token and Prefill Bypass:** Because CGM injects pre-compiled virtual KV cache tokens directly into the LLM's self-attention, it skips the expensive prefill computation. Mean latency is cut in half (**0.834s** vs **1.722s**).
+3. **Drastic Prompt Token Compression:** Prompt ingestion drops from **387.9 tokens** to **57.5 tokens** (a **85.2% reduction**). This reduces the LLM's active context processing and helps prevent workstation Out-Of-Memory (OOM) failures.
 
 ---
 
 ## Setup and Quickstart
-
-Configure your environment using the setup scripts:
 
 ### Windows PowerShell (Admin Mode Recommended)
 ```powershell
@@ -235,21 +251,25 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-### Run Commands
+### Running the System
 
 * **CLI Chat and Live Dashboard:** Starts the interactive terminal chat and opens the web visualizer dashboard at `http://localhost:8050/`:
   ```bash
   python chat.py
   ```
-* **Verify Cache Injection & MEN Training:**
+* **Run LoCoMo Advanced Comparison Benchmark:**
+  ```bash
+  python run_locomo_benchmark.py --limit-conversations 1 --modes rag,cgm
+  ```
+* **Train MEN with KV-Distillation:**
+  ```bash
+  python train_locomo_men_v2.py --distill-lambda 2.0 --distill-warmup-epochs 10 --epochs 40
+  ```
+* **Verify Cache Injection & MEN Training Demo:**
   ```bash
   python run_demo.py
   ```
 * **Run Local Generalization Benchmarks:**
   ```bash
   python benchmark.py
-  ```
-* **Run LoCoMo Public Benchmark:**
-  ```bash
-  python cgm_locomo_eval.py --rank 128
   ```

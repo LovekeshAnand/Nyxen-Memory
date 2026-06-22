@@ -257,18 +257,27 @@ def evaluate_recall_for_approach(pipeline, eval_samples, mode="stuffing", conver
             )
             
         # Check correctness (semantic overlap of keyword answer in the response)
-        target_words = sample.target_text.split("is ")[-1].replace(".", "").strip().lower().split()
-        # Clean response
-        res_clean = response.lower()
+        res_clean = response.lower().replace(".", " ").replace(",", " ").replace("?", " ").replace("!", " ").replace("-", " ")
+        res_words = set(res_clean.split())
+        
+        target_words = sample.target_text.split("is ")[-1].replace(".", "").replace(",", "").replace("?", "").replace("!", "").strip().lower().split()
+        stopwords = {"a", "an", "the", "in", "on", "or", "to", "is", "and", "of", "for", "with", "at", "by", "from", "it", "this", "that"}
+        target_words = [w for w in target_words if w not in stopwords]
         
         # If any of the key target words matches, count as correct
         matched = False
-        for word in target_words:
-            if len(word) > 3 and word in res_clean:
+        if target_words:
+            for word in target_words:
+                if len(word) > 3 and word in res_words:
+                    matched = True
+                    break
+            if not matched and any(w in res_words for w in target_words):
                 matched = True
-                break
-        if not matched and any(w in res_clean for w in target_words):
-            matched = True
+        else:
+            raw_words = sample.target_text.lower().replace(".", "").replace(",", "").replace("?", "").replace("!", "").split()
+            raw_words = [w for w in raw_words if w not in stopwords]
+            if any(w in res_words for w in raw_words) or sample.target_text.lower() in response.lower():
+                matched = True
             
         if matched:
             correct += 1
