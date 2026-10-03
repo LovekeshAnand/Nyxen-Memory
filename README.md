@@ -125,41 +125,6 @@ The **Memory Encoder Network (MEN)** is the core neural translator of CGM. It ma
                               │                     │
                               ▼                     ▼
                       [ Injected past_key_values Cache Tensors ]
-```
-
-### 1. LowRankLinear Projector
-MEN utilizes low-rank bottleneck projections instead of fully dense layers to prevent overfitting. We decompose $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ into two low-rank matrices $A \in \mathbb{R}^{r \times d_{\text{in}}}$ and $B \in \mathbb{R}^{d_{\text{out}} \times r}$, where $r \ll \min(d_{\text{in}}, d_{\text{out}})$:
-
-$$W = B \cdot A$$
-
-For rank $r = 128$, this reduces the parameter footprint of the projection layer by **over 70%** (reducing MEN parameters from 11.14M to 2.87M on Qwen 0.5B), regularizing the network to learn smooth semantic-to-attention mappings.
-
-### 2. Semantics-Aware KV Cache Gating (SA-KVR)
-A routing gating network predicts a scalar gating weight $g_l^h \in [0, 1]$ for each layer $l$ and attention head $h$ based on the input triple's embedding vector $x$:
-
-$$g_l^h = \sigma\left( W_g \cdot x + b_g \right)$$
-
-The projected key $K_{\text{proj}}$ and value $V_{\text{proj}}$ are scaled before injection:
-
-$$K_{\text{routed}} = g_l^h \cdot K_{\text{proj}}, \quad V_{\text{routed}} = g_l^h \cdot V_{\text{proj}}$$
-
-### 3. Layer-Depth Routing Prior Constraint (Gaussian Routing)
-Factual knowledge is primarily concentrated in middle transformer layers. We apply a layer-depth routing prior regularization to guide routing gates toward a Gaussian distribution centered on the middle layers:
-
-$$\mathcal{L}_{\text{routing\_prior}} = \frac{1}{L} \sum_{l=0}^{L-1} \left( \bar{g}_l - P(l) \right)^2$$
-
-Where:
-
-$$P(l) = \exp\left( -\frac{(l - \mu)^2}{2\sigma^2} \right)$$
-
-For `Qwen2.5-0.5B-Instruct` (24 layers), we set the mean layer index $\mu = 11.5$ and standard deviation $\sigma = 4.0$. This guides the routing network to inject facts primarily within layers 8–16.
-
-### 4. KV-Distillation Loss & Variance Normalization
-The MEN is trained using a multi-task loss function combining next-token Cross-Entropy generation loss and Mean Squared Error (MSE) KV-distillation:
-
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{generation}} + \lambda_{\text{distill}} \mathcal{L}_{\text{distill}}$$
-
-$$\mathcal{L}_{\text{distill}} = \frac{1}{L} \sum_{l=0}^{L-1} \left( \frac{\text{MSE}(K_{\text{men}}^{(l)}, K_{\text{teacher}}^{(l)})}{\text{Var}(K_{\text{teacher}}^{(l)})} + \frac{\text{MSE}(V_{\text{men}}^{(l)}, V_{\text{teacher}}^{(l)})}{\text{Var}(V_{\text{teacher}}^{(l)})} \right)$$
 
 ---
 
