@@ -36,6 +36,16 @@ def _get_device(cache: DynamicCache) -> Any:
         return cache.layers[0].keys.device
     return "cpu"
 
+def rotary_cos_sin(model, seq_len: int, head_dim: int, device) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """RoPE (cos, sin) shaped (1, 1, seq_len, head_dim), or (None, None) for models without
+    rotary embeddings (e.g. GPT-2, which has no `.model` submodule at all)."""
+    rotary = getattr(getattr(model, "model", None), "rotary_emb", None)
+    if rotary is None:
+        return None, None
+    pos_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+    cos, sin = rotary(torch.zeros(1, 1, seq_len, head_dim, device=device), pos_ids)
+    return cos.unsqueeze(1), sin.unsqueeze(1)
+
 class KVCompressor:
     """
     Double-buffered, in-flight KV cache compressor.
@@ -175,16 +185,9 @@ class KVCompressor:
                 else:
                     cluster_groups[-1].append(i)
                     
-        # Check if model has rotary embeddings
-        has_rotary = hasattr(pipeline.model.model, "rotary_emb")
-        if has_rotary:
-            pos_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
-            dummy_x = torch.zeros(1, 1, seq_len, pipeline.model.config.hidden_size // pipeline.model.config.num_attention_heads).to(device)
-            cos, sin = pipeline.model.model.rotary_emb(dummy_x, pos_ids)
-            cos_u = cos.unsqueeze(1) # shape: (1, 1, seq_len, head_dim)
-            sin_u = sin.unsqueeze(1) # shape: (1, 1, seq_len, head_dim)
-        else:
-            cos_u, sin_u = None, None
+        head_dim = _get_layer_k_v(cache, 0)[0].shape[-1]
+        cos_u, sin_u = rotary_cos_sin(pipeline.model, seq_len, head_dim, device)
+        has_rotary = cos_u is not None
 
         # Apply changes layer by layer
         for layer_idx in range(num_layers):
@@ -235,12 +238,7 @@ class KVCompressor:
             
             # Re-rotate new_k to match new positions in the compressed cache
             if has_rotary:
-                new_seq_len = new_k.shape[2]
-                new_pos_ids = torch.arange(new_seq_len, dtype=torch.long, device=device).unsqueeze(0)
-                new_dummy_x = torch.zeros(1, 1, new_seq_len, pipeline.model.config.hidden_size // pipeline.model.config.num_attention_heads).to(device)
-                new_cos, new_sin = pipeline.model.model.rotary_emb(new_dummy_x, new_pos_ids)
-                new_cos_u = new_cos.unsqueeze(1)
-                new_sin_u = new_sin.unsqueeze(1)
+                new_cos_u, new_sin_u = rotary_cos_sin(pipeline.model, new_k.shape[2], head_dim, device)
                 
                 nk1 = new_k[..., : new_k.shape[-1] // 2]
                 nk2 = new_k[..., new_k.shape[-1] // 2 :]

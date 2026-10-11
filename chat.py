@@ -255,7 +255,6 @@ def interactive_chat():
         import numpy as np
         index_id = pipeline.retriever.encode_id(conversation_id, 1)
         pipeline.retriever.index.add_with_ids(emb.reshape(1, -1), np.array([index_id], dtype=np.uint64))
-        pipeline.retriever.persist()
         
         hmo = HybridMemoryObject(
             turn_id=1,

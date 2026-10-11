@@ -1,3 +1,4 @@
+import re
 import torch
 import hashlib
 import numpy as np
@@ -347,7 +348,8 @@ class CGMPipeline:
             from cgm.training.train_data import encode_triple
             
             # Check for negation terms in user query
-            contains_negation = any(w in query_clean.lower() for w in ["not", "never", "no longer", "decided against", "changed from", "instead of", "delete", "remove", "incorrect"])
+            # Word-boundary match so "another"/"note" don't count as negations
+            contains_negation = re.search(r"\b(not|never|no longer|decided against|changed from|instead of|delete|remove|incorrect)\b", query_clean.lower()) is not None
             
             # Fetch triples from the graph store for each retrieved turn and encode properly
             x_list = []
@@ -477,10 +479,13 @@ class CGMPipeline:
                 with torch.no_grad():
                     with GPULockManager():
                         if cache_key in self._men_cache:
-                            raw_kv_tuples = self._men_cache[cache_key]
+                            raw_kv_tuples = self._men_cache.pop(cache_key)
                         else:
                             raw_kv_tuples = self.men(x_tensor)
-                            self._men_cache[cache_key] = raw_kv_tuples
+                        self._men_cache[cache_key] = raw_kv_tuples  # re-insert = most recent
+                        # ponytail: tiny LRU via dict order; entries hold GPU KV tensors, so keep it small.
+                        while len(self._men_cache) > 32:
+                            self._men_cache.pop(next(iter(self._men_cache)))
                         
                         past_key_values = DynamicCache()
                         
@@ -491,14 +496,10 @@ class CGMPipeline:
                             attn_dtype = next(self.model.parameters()).dtype
                         
                         # Apply RoPE to key states if model has rotary embeddings
-                        if hasattr(self.model.model, "rotary_emb"):
-                            pos_ids = torch.arange(memory_length, dtype=torch.long, device=self.device).unsqueeze(0)
-                            dummy_x = torch.zeros(1, 1, memory_length, self.model.config.hidden_size // self.model.config.num_attention_heads).to(self.device)
-                            cos, sin = self.model.model.rotary_emb(dummy_x, pos_ids)
-                            cos_u = cos.unsqueeze(1).to(dtype=attn_dtype) # (1, 1, memory_length, head_dim)
-                            sin_u = sin.unsqueeze(1).to(dtype=attn_dtype) # (1, 1, memory_length, head_dim)
-                        else:
-                            cos_u, sin_u = None, None
+                        from cgm.core.compressor import rotary_cos_sin
+                        cos_u, sin_u = rotary_cos_sin(self.model, memory_length, self.men.head_dim, self.device)
+                        if cos_u is not None:
+                            cos_u, sin_u = cos_u.to(dtype=attn_dtype), sin_u.to(dtype=attn_dtype)
                             
                         for idx, (k_val, v_val) in enumerate(raw_kv_tuples):
                             k_cast = k_val.to(dtype=attn_dtype)

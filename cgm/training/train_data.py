@@ -5,7 +5,7 @@ Builds per-triple training examples with proper [enc(subj||pred); enc(obj)] enco
 and splits them into disjoint train/eval sets for generalization measurement.
 """
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import Any, List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
 

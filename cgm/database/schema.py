@@ -236,29 +236,31 @@ class SQLiteGraphStore:
                 for triple in hmo.triples:
                     subj, pred, obj = triple[0], triple[1], triple[2]
                     
-                    # Detect negation triples
+                    # Detect negation triples; clean_pred is the base predicate without the NOT marker
                     is_neg = 0
                     clean_pred = pred
-                    if pred.startswith("NOT_") or "not_" in pred.lower() or pred.lower().startswith("not "):
+                    if pred.lower().startswith(("not_", "not ")):
                         is_neg = 1
-                        if pred.startswith("NOT_"):
-                            clean_pred = pred[4:]
+                        clean_pred = pred[4:]
+                    elif "not_" in pred.lower():
+                        is_neg = 1
                     
-                    # Find conflicting active triples (same subject, same predicate/clean_pred, valid_until is null)
+                    # Find active triples on the same subject/base predicate, negated or not
                     cursor.execute("""
-                        SELECT id, object FROM triples
-                        WHERE conversation_id = ? AND subject = ? AND (predicate = ? OR predicate = ?)
+                        SELECT id, object, is_negated FROM triples
+                        WHERE conversation_id = ? AND subject = ? AND (predicate = ? OR predicate = ? OR predicate = ?)
                           AND tenant_id = ? AND user_id = ? AND valid_until IS NULL
-                    """, (conversation_id, subj, pred, clean_pred, tenant_id, user_id))
+                    """, (conversation_id, subj, pred, clean_pred, "NOT_" + clean_pred, tenant_id, user_id))
                     existing = cursor.fetchall()
                     
-                    # If this new triple is negated, or if we have an active conflicting object
+                    # Supersede: a new value for a positive predicate (single-valued update),
+                    # or the same object with its negation flipped ("not X" <-> "X").
                     superseded_ids = []
                     for row in existing:
                         old_id = row["id"]
-                        old_obj = row["object"]
-                        
-                        if is_neg == 1 or old_obj.lower().strip() != obj.lower().strip():
+                        same_obj = row["object"].lower().strip() == obj.lower().strip()
+                        old_neg = row["is_negated"] or 0
+                        if (same_obj and old_neg != is_neg) or (not same_obj and not is_neg and not old_neg):
                             cursor.execute("""
                                 UPDATE triples
                                 SET valid_until = ?

@@ -53,7 +53,7 @@ An hour later, you ask it to write a caching layer. A standard AI will likely su
 
 3. **Remembers, not retrieves:** Instead of adding memory to your prompt, Nyxen Memory encodes the retrieved facts into neural Key-Value tensors using a trained **Memory Encoder Network (MEN)**, and injects them directly into the model's attention cache. From the model's perspective, it's as if those memories were part of its own computation from the start.
 
-4. **Stays fast and stable:** The entire injection pipeline is hardware-aware. Native C++ guards monitor GPU VRAM and system RAM in real time, applying thermal pacing and cache compression to keep the system stable on consumer-grade workstations.
+4. **Stays fast and stable:** The entire injection pipeline is hardware-aware. Native Rust guards monitor GPU VRAM and system RAM in real time, applying thermal pacing and cache compression to keep the system stable on consumer-grade workstations.
 
 ---
 
@@ -181,9 +181,9 @@ After every turn, an NLP parser runs on the combined user-assistant exchange and
 
 Nyxen Memory is designed to run on consumer-grade NVIDIA RTX laptops and workstations — hardware that is GPU VRAM-constrained, thermally sensitive, and shared with other system processes. The framework includes a dedicated hardware safety layer to prevent crashes and degradation.
 
-### Native C++ Safety Guard (`safety_guard.dll` / `.cpp`)
+### Native Rust Safety Guard (`cgm_rust_speedups`)
 
-A native C++ library compiled for 64-bit Windows uses the **Win32 API** and **NVML (NVIDIA Management Library)** to monitor system resources in real time:
+A small Rust library (`cgm_rust_speedups/`, built by the setup scripts when `cargo` is available) uses the **Win32 API** and **NVML (NVIDIA Management Library)** to monitor system resources in real time. If it isn't built, the Python layer falls back to `torch.cuda.mem_get_info` / `psutil`:
 
 - **VRAM headroom monitoring:** Before each generation call, the guard checks available GPU VRAM. If headroom drops below a configured threshold, the KV cache compressor is triggered proactively to free memory before the LLM allocation would fail.
 - **RAM pressure detection:** System RAM usage is monitored via Win32's `GlobalMemoryStatusEx`. Under high RAM pressure, non-essential in-memory caches are flushed.
@@ -193,7 +193,7 @@ The Python layer wraps this library via `ctypes`, exposing a clean Python API wh
 
 ### Proactive KV Cache Compression
 
-As conversations grow longer, the injected virtual KV cache grows proportionally. The **double-buffered KV cache compressor** runs before generation (not after) to prune stale virtual memory slots while keeping the `hot_window` — the most recent `128` turns of cache — fully intact. This ensures that even very long sessions can run indefinitely without OOM failures.
+As conversations grow longer, the injected virtual KV cache grows proportionally. The **double-buffered KV cache compressor** runs before generation (not after) to prune stale virtual memory slots while keeping the `hot_window` — the most recent `128` KV positions — fully intact. This ensures that even very long sessions can run indefinitely without OOM failures.
 
 ---
 
@@ -293,9 +293,7 @@ Nyxen-Memory/
 │   │   ├── retriever.py              # Base retrieval class & RRF fusion logic
 │   │   └── rag_retriever.py          # Dense vector search via TurboVec quantized index
 │   ├── safety/
-│   │   ├── safety.py                 # Python ctypes wrapper for the native safety guard
-│   │   ├── safety_guard.cpp          # Win32 + NVML C++ source — VRAM, RAM & thermal monitoring
-│   │   └── safety_guard.dll          # Pre-compiled 64-bit Windows native library
+│   │   └── safety.py                 # ctypes wrapper for the Rust guard, with pure-Python fallbacks
 │   ├── training/
 │   │   ├── train.py                  # MEGATrainer — KV-distillation optimizer & training loop
 │   │   └── train_data.py             # Training sample extraction & teacher cache collection
@@ -304,7 +302,9 @@ Nyxen-Memory/
 ├── data/                             # Runtime databases, TurboVec index files & benchmark reports
 ├── docs/                             # Architecture deep-dives & reference diagrams
 ├── eval/                             # Evaluation harnesses & scoring utilities
+├── cgm_rust_speedups/                # Rust source for the native VRAM / RAM / thermal guard
 ├── scripts/                          # Utility & automation scripts
+├── tests/                            # Offline regression checks (python tests/test_core.py)
 ├── requirements.txt                  # Python dependencies
 ├── setup.ps1                         # Windows PowerShell setup script (admin recommended)
 ├── setup.sh                          # Linux / macOS / Git Bash setup script
@@ -328,7 +328,7 @@ Nyxen-Memory/
 
 ### Installation
 
-**Windows (PowerShell — run as Administrator for C++ safety guard compilation):**
+**Windows (PowerShell — run as Administrator for native guard compilation):**
 ```powershell
 ./setup.ps1
 ```
@@ -338,7 +338,7 @@ Nyxen-Memory/
 chmod +x setup.sh && ./setup.sh
 ```
 
-The setup scripts handle virtual environment creation, dependency installation, CUDA toolkit verification, and native C++ guard compilation automatically.
+The setup scripts handle virtual environment creation, dependency installation, CUDA toolkit verification, and native Rust guard compilation (if `cargo` is installed) automatically.
 
 **Manual installation (if you prefer):**
 ```bash

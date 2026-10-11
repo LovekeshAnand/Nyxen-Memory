@@ -87,12 +87,10 @@ class RAGRetriever:
     Performs reciprocal rank fusion (RRF) and Cross-Encoder reranking.
     """
     def __init__(self, store: SQLiteGraphStore, device: Optional[str] = None, 
-                 embedding_model_name: str = "all-MiniLM-L6-v2", 
-                 index_path: str = "data/cgm_rag.tvim"):
+                 embedding_model_name: str = "all-MiniLM-L6-v2"):
         self.store = store
         self.device = device
         self.embedding_model_name = embedding_model_name
-        self.index_path = index_path
         self._embedder = None
         self._cross_encoder = None
         self.index = None
@@ -104,20 +102,21 @@ class RAGRetriever:
         self._init_index()
 
     def _init_index(self):
-        if self.index_path:
-            os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
-            if os.path.exists(self.index_path):
-                print(f"[RAGRetriever] Loading existing TurboVec index from: {self.index_path}")
-                try:
-                    with GPULockManager():
-                        self.index = IdMapIndex.load(self.index_path)
-                except Exception as e:
-                    print(f"[RAGRetriever] Error loading index: {e}. Creating a new one.")
-                
-        if self.index is None:
-            print("[RAGRetriever] Initializing a new TurboVec IdMapIndex (384-dim, 4-bit width)...")
-            with GPULockManager():
-                self.index = IdMapIndex(dim=384, bit_width=4)
+        """Build the in-memory TurboVec index from SQLite turn_embeddings (the source of truth),
+        so each store gets its own index and nothing goes stale on disk."""
+        with self.store._lock:
+            conn = self.store._get_connection()
+            rows = conn.execute(
+                "SELECT conversation_id, turn_id, tenant_id, user_id, data FROM turn_embeddings"
+            ).fetchall()
+            conn.close()
+        with GPULockManager():
+            self.index = IdMapIndex(dim=384, bit_width=4)
+            if rows:
+                vecs = np.stack([np.frombuffer(r["data"], dtype=np.float32) for r in rows])
+                ids = np.array([self.encode_id(r["conversation_id"], r["turn_id"], r["tenant_id"], r["user_id"])
+                                for r in rows], dtype=np.uint64)
+                self.index.add_with_ids(vecs, ids)
 
     @property
     def embedder(self):
@@ -170,26 +169,18 @@ class RAGRetriever:
             embeddings = self.embedder.encode(texts, convert_to_numpy=True)
         return embeddings
 
-    def persist(self):
-        if self.index is not None and self.index_path:
-            os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
-            with GPULockManager():
-                self.index.write(self.index_path)
-            print(f"[RAGRetriever] TurboVec index successfully persisted to: {self.index_path}")
-
     def reset_index(self):
-        """Reset the persistent TurboVec index so a conversation can be re-seeded cleanly."""
-        if self.index_path and os.path.exists(self.index_path):
-            os.remove(self.index_path)
-        with GPULockManager():
-            self.index = IdMapIndex(dim=384, bit_width=4)
+        """Rebuild the index from SQLite, e.g. after rows were deleted."""
+        self._init_index()
         self._embedding_cache.clear()
         self._cache_hits = 0
         self._cache_misses = 0
 
-    def encode_id(self, conversation_id: str, turn_id: int) -> int:
+    def encode_id(self, conversation_id: str, turn_id: int,
+                  tenant_id: str = "default_tenant", user_id: str = "default_user") -> int:
         import hashlib
-        h = hashlib.sha256(conversation_id.encode('utf-8')).digest()
+        scope = f"{tenant_id}|{user_id}|{conversation_id}"
+        h = hashlib.sha256(scope.encode('utf-8')).digest()
         conv_hash = int.from_bytes(h[:6], byteorder='big')
         return (conv_hash << 16) | (turn_id & 0xFFFF)
 
@@ -198,8 +189,10 @@ class RAGRetriever:
                    assistant_text: Optional[str] = None, tenant_id: str = "default_tenant", user_id: str = "default_user",
                    dia_id: Optional[str] = None):
         embedding = self.embed_text(text)
-        index_id = self.encode_id(conversation_id, turn_id)
+        index_id = self.encode_id(conversation_id, turn_id, tenant_id, user_id)
         with GPULockManager():
+            if self.index.contains(index_id):  # re-storing a turn replaces it
+                self.index.remove(index_id)
             self.index.add_with_ids(embedding.reshape(1, -1), np.array([index_id], dtype=np.uint64))
             
         self.store.save_turn_embedding(conversation_id, turn_id, embedding, tenant_id=tenant_id, user_id=user_id)
@@ -217,7 +210,6 @@ class RAGRetriever:
             dia_id=dia_id
         )
         self.store.save_hmo(conversation_id, hmo, tenant_id=tenant_id, user_id=user_id)
-        self.persist()
 
         try:
             log_pipeline_event("store", {
@@ -275,8 +267,8 @@ class RAGRetriever:
         
         # 3. Dense Retrieval (TurboVec)
         query_emb = self.embed_text(query)
-        recent_ids = [self.encode_id(conversation_id, row["turn_id"]) for row in all_turns]
-        recent_ids = [rid for rid in recent_ids if rid in self.index]
+        recent_ids = [self.encode_id(conversation_id, row["turn_id"], tenant_id, user_id) for row in all_turns]
+        recent_ids = [rid for rid in recent_ids if self.index.contains(rid)]
         
         dense_scores_dict = {}
         if recent_ids:
